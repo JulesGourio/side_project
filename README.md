@@ -1,1 +1,106 @@
-# side_project
+# Qualibot — evaluation and quality monitoring
+
+Evaluation and monitoring of the Qualibot Knowledge Assistants on Databricks (MLflow GenAI).
+Working conventions, environment and project status: see `CLAUDE.md`.
+
+## Data reference
+
+Schemas and sample records of the source data, as observed in the UAT workspace.
+
+### Document chunks — `uat_landingzone.qualibot.chunks_v1`
+
+Source table of the Vector Search index `uat_landingzone.qualibot.chunks_index_v1`. One row per chunk.
+
+| Column | Content |
+|---|---|
+| `IDDOC` | Numeric document id (e.g. `24924`) |
+| `REF` | Document code (e.g. `GO-1536`) |
+| `division` | `AS` or `IS` |
+| `chunk_id` | Chunk id, `<IDDOC>-<type>-<n>` (e.g. `24924-IMG-003`) |
+| `chunk_index` | Position of the chunk in the document (enables neighbour expansion) |
+| `chunk_text` | Text, prefixed by a metadata header (see below) |
+| `chunk_token_count` | Token count of the chunk |
+| `chunk_content_type` | Type of content (e.g. `image`) |
+| `semantic_headers` | JSON; for images: `image_label`, `volume_path`, `captions` |
+| `chunk_sha256` | Hash of the chunk content |
+| `url` | Intraqual link: `https://intraqual.lat.corp/intraqual_prod/identification.aspx?ref=<REF>` |
+| `doc_date` | Publication date of the document |
+
+Header of `chunk_text`: the title, division, category and date are in the text, not in dedicated columns.
+
+```text
+[Source: GO-1536 | Title: Guide outils pour préparateur de l'imprimante BRADY RFID | Division: AS |
+ Category: AS - PROCESSES / PROCESSUS > R40- Produce | Date de diffusion: 2026-09-23 | Image: page ?, picture]
+# [PHOTO_TECH] Poste de travail industriel équipé pour l'impression, le contrôle et la gestion informatique. ...
+```
+
+Sample `semantic_headers` of an image chunk:
+`{"image_label": "picture", "volume_path": "/Volumes/uat_landingzone/qualibot/images/24924/24924_IMG_003.png", "captions": "[]"}`
+
+### Chat logs — `uat_landingzone.qualibot.chat_messages`
+
+One row per message (user or assistant).
+
+| Column | Content |
+|---|---|
+| `id` | Message id |
+| `session_id` | Conversation id |
+| `role` | `user` / `assistant` |
+| `content` | Message text (assistant answers cite documents with `⟦n⟧` markers or footnotes) |
+| `created_at`, `deleted`, `deleted_at` | Timestamps and soft deletion |
+| `division` | `ALL`, `AS` or `IS` |
+| `endpoint_name` | Assistant endpoint (NULL on user messages) |
+| `status`, `error_msg` | `ok` / error |
+| `question_lang` | Language code of the question (e.g. `fr`, `cs`) |
+| `reasoning_steps` | Reasoning summary of the assistant, concatenated |
+| `sources_json` | Sources listed by the assistant: `[{"rank", "title", "url", "n"}]` |
+| `tool_name`, `tool_query`, `tool_result` | Tool call fields (NULL in the samples) |
+| `trace_id` | MLflow trace id of the assistant turn (e.g. `2793c134-0c43-427d-a74f-a6a8dd232ef5`) |
+| `user_id`, `workspace_id`, `workspace_url` | Requester and workspace |
+
+Sample `sources_json`:
+
+```json
+[{"rank": 0, "title": "P0043NF_CZ", "url": "https://intraqual.lat.corp/intraqual_prod/identification.aspx?ref=P0043NF_CZ", "n": 1},
+ {"rank": 1, "title": "Q0025MI_GB", "url": "https://intraqual.lat.corp/intraqual_prod/identification.aspx?ref=Q0025MI_GB", "n": 2},
+ {"rank": 2, "title": "P0043NF_MX", "url": "https://intraqual.lat.corp/intraqual_prod/doc/liredocumentdepuisrecherche?id=JIEvgxMhDmnHUWynY%2fRdQQ%3d%3d", "n": null}]
+```
+
+- `n` is the citation number in the answer; sources with `n = null` were returned but not cited.
+- Some URLs carry no `?ref=` (`liredocumentdepuisrecherche?id=…`): the `title` is then the only document code.
+
+### Knowledge Assistant response (trace output)
+
+Streamed in the Responses format. The trace output is the list of stream events:
+
+| Event `type` | Content |
+|---|---|
+| `response.reasoning_summary_text.delta` | Generic reasoning status lines ("Finalizing the set of top-ranked documents...") |
+| `response.output_text.delta` | Answer text, token by token |
+| `response.output_text.annotation.added` | One citation: `annotation.type = url_citation`, `title` = `url` = the Intraqual link with a `#:~:text=` fragment holding the cited passage |
+| `response.output_item.done` | Final message: `item.content[].text` (full answer) and `custom_outputs.sources_used` |
+
+Final answer: documents cited in bold (`**Q0196QP_FR**`), footnotes `[^eOF0-n]` quoting the cited passage and its
+link, and a "Sources" table (REF, title, version, division, date).
+
+Condensed example:
+
+```yaml
+- type: response.output_text.annotation.added
+  annotation:
+    type: url_citation
+    title: https://intraqual.lat.corp/intraqual_prod/identification.aspx?ref=Q0196QP_FR
+    url: https://intraqual.lat.corp/intraqual_prod/identification.aspx?ref=Q0196QP_FR#:~:text=V%C3%A9rification%20de%20la%20connaissance...
+- type: response.output_item.done
+  custom_outputs: {sources_used: true}
+  item: {type: message, role: assistant, content: [{type: output_text, text: "Pour suivre les compétences des opérateurs, ..."}]}
+```
+
+### Observations relevant to the notebooks
+
+- `chunk_index` exists: excerpts can be expanded to neighbouring chunks of the same document.
+- Title, category and date are only available inside the `chunk_text` header (parse it for a document catalogue).
+- The trace output shows no retrieval step with chunk texts; the only retrieved text is the cited passage in each
+  citation (`#:~:text=` fragment and footnotes). Whether the trace spans hold more remains to be checked.
+- Document codes appear with a dot before the language suffix (`PRLAT549.FR`) and with suffixes such as `_BG`:
+  both must be handled by the document key (`LANG_SUFFIXES` and separators).
