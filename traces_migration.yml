@@ -1,0 +1,99 @@
+# Traces Migration Job — Qualibot Knowledge Assistants
+#
+# Copies MLflow traces of the Knowledge Assistants (Agent Bricks experiments
+# ka-<id>-dev-experiment) into Unity Catalog trace tables
+# <catalog>.<schema>.<prefix>_otel_{spans,annotations,logs,metrics},
+# using databricks.migrations.migrate_traces_to_uc (databricks-agents>=1.10.1).
+#
+# Why a scheduled job and not a one-shot: the KAs keep writing their traces to
+# their own experiments (the trace destination of an Agent Bricks KA can't be
+# redirected from here). The migration is idempotent and skips already-copied
+# traces, so a nightly run acts as an incremental sync.
+#
+# Notebook: utils/traces_migration/Migrate_KA_Traces_To_UC.py
+#   base_parameters:
+#     to_migrate          comma-separated table prefixes, or "*" for the 3 KAs
+#                         (trace_test = throw-away KA used to validate the job)
+#     migrate_last_days   empty = full history
+#     repair_destinations true = create missing destination experiments and
+#                         recreate those not linked to UC (0/4 tables)
+#
+# Defined for qualibot-uat only: the KA source experiment ids hardcoded in the
+# notebook are the UAT ones. For prod, move the body under a YAML anchor (same
+# pattern as parsing_pipeline) and pass prod ids/catalog via base_parameters.
+
+targets:
+  qualibot-uat:
+    resources:
+      jobs:
+        traces_migration:
+          # D_<n> prefix: daily job, see the databricks-job-conventions skill
+          # (check D_2 is free in the shared workspace).
+          name: "D_2_qualibot-traces-sync-${bundle.target}"
+          description: "Incremental copy of Qualibot Knowledge Assistant MLflow traces into Unity Catalog"
+
+          # Two overlapping runs would copy the same traces concurrently.
+          max_concurrent_runs: 1
+
+          tags:
+            project: Qualibot
+            activity-type: ${var.parsing_job_activity_tag}
+            job-purpose: traces-migration
+
+          permissions:
+            - group_name: "Role-Project-LEAP-CoreAdmin"
+              level: CAN_MANAGE
+            - group_name: "Role-Project-LEAP-CoreDev"
+              level: CAN_MANAGE
+
+          # Same identity as parsing_pipeline on this target (job-runner-sa-uat).
+          run_as:
+            service_principal_name: 3e5cd4e5-f765-4760-b974-ee7715258b39
+
+          job_clusters:
+            # No policy_id: same accepted exception as parsing_pipeline (the
+            # "Job Compute *" policies force SPOT_WITH_FALLBACK on single-node).
+            # Classic compute is mandatory: the migration runs on the cluster
+            # (DBR >= 15.3), serverless is not supported.
+            - job_cluster_key: traces_cpu_cluster
+              new_cluster:
+                spark_version: "17.3.x-scala2.13"
+                node_type_id: ${var.parsing_describe_node_type}
+                num_workers: 0
+                # Without this, UC table reads/writes fail with [UC_NOT_ENABLED].
+                data_security_mode: SINGLE_USER
+                aws_attributes:
+                  # Single-node cluster: the driver IS the only node, so it must not be spot.
+                  availability: ON_DEMAND
+                spark_conf:
+                  spark.databricks.cluster.profile: singleNode
+                  spark.master: "local[*]"
+                custom_tags:
+                  ResourceClass: SingleNode
+
+          tasks:
+            - task_key: "1_migrate_traces"
+              description: "Create/repair UC trace destinations, then copy new KA traces"
+              job_cluster_key: traces_cpu_cluster
+              timeout_seconds: 14400
+              notebook_task:
+                notebook_path: ../utils/traces_migration/Migrate_KA_Traces_To_UC.py
+                source: WORKSPACE
+                base_parameters:
+                  # First runs: trace_test, then trace_ka_all_v2, then
+                  # trace_ka_is_v2,trace_ka_as_v2. Switch to "*" before unpausing.
+                  to_migrate: "trace_test"
+                  migrate_last_days: ""
+                  repair_destinations: "true"
+                  traces_catalog: "uat_proj"
+                  traces_schema: "qualibot"
+                  experiment_dir: "/Workspace/Users/jules.gourio.external@latecoere.aero/qualibot-traces"
+              # databricks-agents / mlflow are installed by the notebook's own
+              # %pip cell (keeps the notebook runnable interactively as well).
+
+          # Nightly incremental sync. Left PAUSED until the manual runs above
+          # are validated.
+          schedule:
+            quartz_cron_expression: "0 30 3 * * ?"
+            timezone_id: "Europe/Paris"
+            pause_status: PAUSED

@@ -1,0 +1,74 @@
+# Quality Scoring Job — Qualibot production turns
+#
+# Judges every assistant turn already answered by the Knowledge Assistants (no call to the KA
+# endpoints): conversation-level quality (1 Luna call) + grounding against the cited documents
+# (1 Luna call, excerpts fetched from the Vector Search index). Writes uat_proj.qualibot.chat_quality_scores
+# (MERGE on message_id) and chat_quality_scoring_runs; the DEV dashboard queries these UAT tables.
+#
+# Notebook: utils/quality_monitoring/Score_Production_QA.py
+#   base_parameters: source_schema / output_schema / experiment_path, plus test_limit, dry_run,
+#   rescore_changed_config for ad-hoc runs ("Run now with different parameters").
+#
+# Sizing: ~30 turns/day today, peaks of 300+ expected in prod → 2 Luna calls per turn,
+# 8 turns in parallel (MAX_WORKERS in the notebook): a 150-turn run takes ~10-15 min.
+
+targets:
+  qualibot-uat:
+    resources:
+      jobs:
+        quality_scoring:
+          # D_<n> prefix: daily job, see the databricks-job-conventions skill (check D_3 is free).
+          name: "D_3_qualibot-quality-scoring-${bundle.target}"
+          description: "LLM-judge quality scoring of Qualibot production turns (quality + grounding on cited documents)"
+
+          # Two overlapping runs would score the same turns twice.
+          max_concurrent_runs: 1
+
+          tags:
+            project: Qualibot
+            activity-type: ${var.parsing_job_activity_tag}
+            job-purpose: quality-monitoring
+
+          permissions:
+            - group_name: "Role-Project-LEAP-CoreAdmin"
+              level: CAN_MANAGE
+            - group_name: "Role-Project-LEAP-CoreDev"
+              level: CAN_MANAGE
+
+          # Same identity as parsing_pipeline / traces_migration on this target (job-runner-sa-uat).
+          run_as:
+            service_principal_name: 3e5cd4e5-f765-4760-b974-ee7715258b39
+
+          tasks:
+            - task_key: "1_score_turns"
+              description: "Score new assistant turns, MERGE by batch, run ledger, alerts, MLflow run"
+              timeout_seconds: 7200
+              # Serverless: HTTP calls to Luna + Vector Search, light Spark SQL.
+              environment_key: scoring_env
+              notebook_task:
+                notebook_path: ../utils/quality_monitoring/Score_Production_QA.py
+                source: WORKSPACE
+                base_parameters:
+                  source_schema: "uat_landingzone.qualibot"
+                  output_schema: "uat_proj.qualibot"
+                  experiment_path: "/Shared/qualibot-quality-scoring"
+                  test_limit: ""
+                  dry_run: "false"
+                  rescore_changed_config: "false"
+                  reset_outputs: "false"
+
+          environments:
+            - environment_key: scoring_env
+              spec:
+                environment_version: "5"
+                # mlflow is checked (and only installed if missing) by the notebook's first cell,
+                # with the runtime's packages pinned — see the protobuf kernel crash of 2026-09.
+                dependencies:
+                  - httpx
+
+          # Twice a day. Align on the refresh of uat_landingzone.qualibot.chat_messages.
+          # Left PAUSED until a first manual run (dry_run=true, then test_limit=20) is validated.
+          schedule:
+            quartz_cron_expression: "0 0 3,15 * * ?"
+            timezone_id: "Europe/Paris"
+            pause_status: PAUSED
