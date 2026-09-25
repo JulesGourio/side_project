@@ -3,6 +3,29 @@
 Evaluation and monitoring of the Qualibot Knowledge Assistants on Databricks (MLflow GenAI).
 Working conventions, environment and project status: see `CLAUDE.md`.
 
+| Notebook | MLflow experiment | What it shows |
+|---|---|---|
+| `Build_Golden_Dataset.py` | evaluation experiment (Datasets tab) | the golden dataset `uat_landingzone.qualibot.qualibot_eval_golden` (20-30 reviewed cases) |
+| `Evaluate_Knowledge_Assistant.py` | `.../qualibot-traces/trace_eval_all_v2` (traces in Unity Catalog) | one run per evaluation, one trace per case, 9 LLM judges and 3 code scorers registered, the golden dataset linked to every run |
+| `Score_Production_QA.py` (job D_3) | `/Shared/qualibot-quality-scoring` | one run per scoring run, one trace per production turn, 10 LLM judges and 2 code scorers registered |
+| `Migrate_KA_Traces_To_UC.py` (job D_2) | `.../qualibot-traces/trace_ka_*` | the assistants' own traces, copied to Unity Catalog |
+
+## Local tests
+
+The notebooks cannot run outside Databricks; `tests/` runs their real cells locally with a real MLflow tracking store
+(SQLite) and simulated judge model, Vector Search, assistant endpoint and Spark.
+
+```bash
+python -m venv .venv && .venv/bin/pip install "mlflow==3.11.1" pandas "sqlalchemy<2.0.40"   # minimum supported MLflow
+.venv/bin/python tests/test_scoring.py        # production scoring: 4 scenarios, verdicts, tables, MLflow run
+.venv/bin/python tests/test_scoring.py dry    # production scoring dry run
+.venv/bin/python tests/test_eval.py 3         # evaluation on a 3-case sample; "" = full dataset
+.venv/bin/python tests/test_refs.py           # document keys agree across the notebooks
+.venv/bin/pip install pyspark==3.5.3 && .venv/bin/python tests/test_neighbours.py   # neighbour expansion (needs Java)
+```
+
+Registering `@scorer` code scorers is only possible on Databricks: locally, the tests report them as "not registered".
+
 ## Data reference
 
 Schemas and sample records of the source data, as observed in the UAT workspace.

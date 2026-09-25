@@ -13,12 +13,12 @@
 # MAGIC | 2 | Annotate every question: intent, quality, test value, self-contained rewrite, feedback triage | 1 per question |
 # MAGIC | 3 | Build a diversified shortlist: embeddings + clustering + quotas, including production failures | embeddings |
 # MAGIC | 4 | Query the current assistant, and generate search queries (keywords, translation, title, hypothetical answer) | 1 per case |
-# MAGIC | 5 | Pool evidence from many retrieval routes, then expand around the most relevant chunks | – |
-# MAGIC | 6 | Grade every candidate chunk | 1 per chunk |
+# MAGIC | 5 | Pool evidence from many retrieval routes | – |
+# MAGIC | 6 | Grade every candidate chunk, expand around the most relevant ones (similar chunks of the same document, and the chunks just before and after in document order), grade the additions | 1 per chunk |
 # MAGIC | 7 | Generate two independent reference answers (A/B) from the relevant chunks | 2 per case |
 # MAGIC | 8 | Arbitrate: merge A/B, confront the assistant's answers, verdicts, confidence | 1 per case |
 # MAGIC | 9 | Verify every fact independently | 1 per case |
-# MAGIC | 10 | Consolidate and select a balanced final set | – |
+# MAGIC | 10 | Consolidate and select a balanced final set of 20 to 30 cases, compliance-matrix questions included | – |
 # MAGIC | 11 | Human review (validate / reject / expert) | – |
 # MAGIC | 12 | Export to the MLflow evaluation dataset (Unity Catalog), linked to the evaluation experiment | – |
 # MAGIC | 13 | Cost: estimate vs actual | – |
@@ -36,7 +36,7 @@
 # DBTITLE 1,Setup — installs only missing packages, without altering the runtime's own packages
 import importlib.metadata as md, subprocess, sys
 
-NEEDED = {"mlflow": (3, 4), "scikit-learn": (1, 0)}
+NEEDED = {"mlflow": (3, 11), "scikit-learn": (1, 0)}   # same MLflow as the evaluation notebook
 
 
 def _as_tuple(text):
@@ -73,7 +73,6 @@ import html as html_mod
 import json
 import math
 import re
-import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -105,7 +104,8 @@ INCLUDE_EMAIL = "jules.gourio.external@latecoere.aero"
 EXCLUDED_GROUPS = {"Role-Project-LEAP-CoreDev", "Role-Project-LEAP-CoreAdmin"}
 
 # ── Sizes and thresholds ──
-TARGET_N = 25                    # final dataset size
+TARGET_N = 30                    # final dataset size (20 to 30 cases after the human review)
+MIN_EXPORTED = 20                # the export warns below this size
 HISTORY_TURNS = 4                # history messages kept for multi-turn questions
 N_CLUSTERS = 60
 DEDUP_SIM = 0.90                 # cosine above which two questions are duplicates
@@ -114,18 +114,20 @@ MAX_POOL_CHUNKS = 45             # candidate chunks graded per case (first pass)
 EXPANSION_PER_CHUNK = 4          # chunks fetched around each highly relevant chunk (second pass)
 MAX_CONTEXT_CHUNKS = 16          # relevant chunks given to the reference generators
 EXCLUDED_INTENTS = {"chitchat_or_meta", "link_or_navigation"}
-LANG_SUFFIXES = ["FR", "GB", "EN", "UK", "CZ", "ES", "DE", "PT", "IT", "MX"]
+LANG_SUFFIXES = ["FR", "GB", "EN", "UK", "CZ", "ES", "DE", "PT", "IT", "MX", "BG", "RO", "PL", "TN"]
+NEIGHBOUR_WINDOW = 1             # chunks taken before and after each directly relevant chunk (document order)
 
 # Shortlist quotas for log questions (predicates in section 3)
 SLOT_QUOTAS = {
-    "production_failure": 6, "negative_feedback": 5, "suspect_answer": 4, "multi_doc_or_hard": 4,
-    "document_lookup": 5, "procedure": 4, "rule_requirement": 5, "definition_acronym": 3,
-    "multi_turn": 3, "out_of_scope": 2, "other_language": 1,
+    "production_failure": 8, "negative_feedback": 5, "suspect_answer": 4, "multi_doc_or_hard": 4,
+    "requirement_compliance": 4, "document_lookup": 5, "procedure": 4, "rule_requirement": 4,
+    "definition_acronym": 3, "multi_turn": 3, "out_of_scope": 2, "other_language": 1,
 }
 # Final selection constraints
 MAX_PER_INTENT = 6
-MIN_KA_FAIL = 8                  # cases the assistant fails: they discriminate between versions of the assistant
-MIN_KA_OK = 6                    # cases the assistant passes: regression protection
+MIN_KA_FAIL = 10                 # cases the assistant fails: they discriminate between versions of the assistant
+MIN_KA_OK = 8                    # cases the assistant passes: regression protection
+MIN_COMPLIANCE = 3               # customer compliance-matrix questions (about half of the production traffic)
 MIN_REFUSAL_CASES = 2            # expected answer = "not in the documentation" / out of scope
 MAX_NEEDS_EXPERT = 3             # low-confidence cases kept for expert review
 
@@ -200,7 +202,7 @@ spark.sql(f"""CREATE TABLE IF NOT EXISTS {CACHE_TABLE} (
     payload STRING, payload_schema STRING, updated_at TIMESTAMP) USING DELTA
     COMMENT 'Golden dataset builder cache: one row per step x question [x chunk], JSON payload'""")
 
-CHUNK_STAGES = {"evidence_pool", "evidence_expansion", "chunk_grades"}
+CHUNK_STAGES = {"evidence_pool", "evidence_expansion", "evidence_neighbours", "chunk_grades"}
 
 
 # ── Step cache ──
@@ -429,8 +431,8 @@ def _estimate(name, res):
 
 # ── Document references ──
 _EXT = re.compile(r"\.(pdf|docx?|xlsx?|pptx?|txt)$", re.I)
-_LANG = re.compile(r"[-_ ](%s)$" % "|".join(LANG_SUFFIXES), re.I)
-_CODE = re.compile(r"^(?=.*\d)[A-Z][A-Z0-9_\-]{2,28}( (%s))?$" % "|".join(LANG_SUFFIXES))
+_LANG = re.compile(r"[-_. ](%s)$" % "|".join(LANG_SUFFIXES), re.I)
+_CODE = re.compile(r"^(?=.*\d)(?=(?:.*[A-Z]){2})[A-Z][A-Z0-9_.\-]{2,28}( (%s))?$" % "|".join(LANG_SUFFIXES))
 _BOLD = re.compile(r"\*\*([^*\n]{3,40})\*\*")
 _REF_IN_URL = re.compile(r"[?&]ref=([A-Za-z0-9_.\-]+)", re.I)
 
@@ -440,7 +442,8 @@ def _strip(s) -> str:
 
 
 def base_ref(s) -> str:
-    """Document key, insensitive to language suffix, separators, case and zero padding."""
+    """Document key, insensitive to language suffix, separators, case and zero padding:
+    PRLAT538_FR, PRLAT538.FR → PRLAT538; IN_APO_006 and IN_APO_0006 → INAPO6."""
     groups = re.findall(r"[A-Za-z]+|\d+", _strip(s).upper())
     return "".join(str(int(g)) if g.isdigit() else g for g in groups)
 
@@ -753,7 +756,8 @@ SLOT_PREDICATES = {
     "multi_doc_or_hard":  lambda r: r.intent == "comparison_multi_doc" or r.difficulty == "hard",
     "document_lookup":    lambda r: r.intent == "document_lookup",
     "procedure":          lambda r: r.intent == "procedure_howto",
-    "rule_requirement":   lambda r: r.intent in ("rule_requirement", "requirement_compliance"),
+    "requirement_compliance": lambda r: r.intent == "requirement_compliance",
+    "rule_requirement":   lambda r: r.intent == "rule_requirement",
     "definition_acronym": lambda r: r.intent == "definition_acronym",
     "multi_turn":         lambda r: is_false(r.is_self_contained),
     "out_of_scope":       lambda r: r.intent == "out_of_scope" or r.in_scope == "no",
@@ -949,7 +953,7 @@ display(df_pool.groupBy("question_id").agg(F.count("*").alias("chunks"), F.count
 
 # COMMAND ----------
 
-# DBTITLE 1,6. Chunk grading, expansion around the best chunks, second grading pass
+# DBTITLE 1,6. Chunk grading, expansion around the best chunks (similar and adjacent chunks), second grading pass
 PROMPT_GRADE = """You are a strict relevance assessor for a RAG benchmark on aerospace quality documentation.
 Judge whether the EXCERPT helps answer the QUESTION.
 - 3: contains information that directly answers the question (fully or an essential part of it).
@@ -974,10 +978,13 @@ def build_grades(d):
 
 
 def all_evidence():
-    """First-pass pool ∪ expansion chunks."""
-    pool = load_stage("evidence_pool")
-    exp = load_stage("evidence_expansion")
-    return pool if exp is None else pool.unionByName(exp)
+    """First-pass pool ∪ expansion chunks (similar chunks of the same document, adjacent chunks)."""
+    out = load_stage("evidence_pool")
+    for stage in ("evidence_expansion", "evidence_neighbours"):
+        extra = load_stage(stage)
+        if extra is not None:
+            out = out.unionByName(extra)
+    return out
 
 
 def grade(evidence):
@@ -1018,6 +1025,38 @@ exp_in = (pool.join(graded, ["question_id", "chunk_id"])
           .filter(F.size("best_chunks") > 0))
 incremental_py("evidence_expansion", exp_in, compute_expansion, POOL_SCHEMA)
 
+
+# Neighbours: the chunks just before and after each directly relevant chunk, in document order (chunk_index of the
+# index source table). They hold continuations of procedures, table rows and exceptions that similarity misses.
+def compute_neighbours(rows):
+    """rows: one per case with best_chunks = [(REF, chunk_text)] graded 3 and known_ids = chunks already pooled."""
+    best = spark.createDataFrame([(int(r.question_id), c["REF"], c["chunk_text"]) for r in rows for c in r.best_chunks],
+                                 "question_id long, REF string, chunk_text string")
+    src = spark.table(vs_source_table()).select("IDDOC", "REF", "chunk_index", "chunk_text", "semantic_headers")
+    anchors = best.join(src.select("IDDOC", "REF", "chunk_index", "chunk_text"), ["REF", "chunk_text"]) \
+                  .select("question_id", "IDDOC", F.col("chunk_index").alias("anchor_index"))
+    hits = (anchors.join(src, "IDDOC")
+            .filter((F.abs(F.col("chunk_index") - F.col("anchor_index")) <= NEIGHBOUR_WINDOW)
+                    & (F.col("chunk_index") != F.col("anchor_index")))
+            .select("question_id", "REF", "semantic_headers", "chunk_text").collect())
+    known = {int(r.question_id): set(r.known_ids) for r in rows}
+    out = {}
+    for h in hits:
+        cid = chunk_key(h.chunk_text or "")
+        if h.chunk_text and cid not in known[int(h.question_id)]:
+            out[(int(h.question_id), cid)] = (int(h.question_id), cid, h.REF, str(h.semantic_headers or ""),
+                                              h.chunk_text, ["neighbour"], 0.0)
+    return list(out.values())
+
+
+pooled = all_evidence().select("question_id", "chunk_id")
+nb_in = (all_evidence().join(load_stage("chunk_grades").select("question_id", "chunk_id", "relevance"), ["question_id", "chunk_id"])
+         .groupBy("question_id")
+         .agg(F.collect_list(F.when(F.col("relevance") == 3, F.struct("REF", "chunk_text"))).alias("best_chunks"))
+         .join(pooled.groupBy("question_id").agg(F.collect_list("chunk_id").alias("known_ids")), "question_id")
+         .filter(F.size("best_chunks") > 0))
+incremental_py("evidence_neighbours", nb_in, compute_neighbours, POOL_SCHEMA)
+
 grades = grade(all_evidence())
 display(grades.groupBy("relevance").count().orderBy("relevance"))
 
@@ -1036,6 +1075,7 @@ def evidence_df():
         F.max(((F.col("relevance") == 3) & (F.array_contains("origins", "assistant_logs")
                                             | F.array_contains("origins", "assistant_current"))).cast("int")).alias("assistant_retrieved_relevant"),
         F.max(((F.col("relevance") == 3) & F.array_contains("origins", "expansion")).cast("int")).alias("found_by_expansion"),
+        F.max(((F.col("relevance") == 3) & F.array_contains("origins", "neighbour")).cast("int")).alias("found_by_neighbour"),
         F.count("*").alias("n_relevant_chunks"))
         .withColumn("context", F.concat_ws("\n---\n", F.transform("_top", lambda e: e["_txt"])))
         .withColumn("context_rev", F.concat_ws("\n---\n", F.transform(F.reverse("_top"), lambda e: e["_txt"])))
@@ -1283,6 +1323,8 @@ def select_final(pdf):
 
     ok = pdf[pdf["confidence_final"] >= 2]
     fill(ok[ok["ka_verdict"].isin(KA_FAIL)], MIN_KA_FAIL - count(lambda r: r.ka_verdict in KA_FAIL))
+    fill(ok[ok["intent"] == "requirement_compliance"],
+         MIN_COMPLIANCE - count(lambda r: r.intent == "requirement_compliance"))
     fill(ok[ok["final_answerability"].isin(["none", "out_of_scope"])],
          MIN_REFUSAL_CASES - count(lambda r: r.final_answerability in ("none", "out_of_scope")))
     fill(ok[ok["ka_verdict"] == "correct"], MIN_KA_OK - count(lambda r: r.ka_verdict == "correct"))
@@ -1305,6 +1347,7 @@ GOLDEN_SCHEMA = T.StructType([T.StructField(n, t) for n, t in [
     ("ka_verdict", T.StringType()), ("confidence_arbiter", T.StringType()), ("confidence_final", T.LongType()),
     ("needs_expert", T.BooleanType()), ("found_by_question_query", T.DoubleType()),
     ("assistant_retrieved_relevant", T.DoubleType()), ("found_by_expansion", T.DoubleType()),
+    ("found_by_neighbour", T.DoubleType()),
     ("n_pool_chunks", T.DoubleType()), ("n_relevant_chunks", T.DoubleType()), ("notes", T.StringType()),
     ("context", T.StringType()), ("essential_facts_json", T.StringType()), ("secondary_facts_json", T.StringType()),
     ("rejected_facts_json", T.StringType()), ("expected_sources_json", T.StringType()), ("guidelines_json", T.StringType()),
@@ -1626,6 +1669,8 @@ rejected = [(int(r.question_id), fix_for(r)["reject"]) for _, r in to_export.ite
 kept = to_export[~to_export["question_id"].isin([q for q, _ in rejected])]
 records = [to_record(r) for _, r in kept.iterrows()]
 print(f"{len(records)} case(s) to export · {len(rejected)} set aside by CASE_FIXES:")
+if len(records) < MIN_EXPORTED:
+    print(f"⚠️ fewer than {MIN_EXPORTED} cases: validate more cases in section 11, or raise TARGET_N and re-run section 10.")
 for q, why in rejected:
     print(f"  #{q}: {why}")
 unused = [k for k, _ in CASE_FIXES if not any(k.lower() in str(m).lower() for m in to_export["messages_json"])]

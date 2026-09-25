@@ -1,4 +1,5 @@
 # Databricks notebook source
+# DBTITLE 1,Header
 # MAGIC %md
 # MAGIC # Qualibot — Knowledge Assistant Trace Migration to Unity Catalog
 # MAGIC
@@ -16,16 +17,17 @@
 
 # COMMAND ----------
 
+# DBTITLE 1,Setup — migration package (classic compute: no serverless package constraints)
 # MAGIC %pip install -qqq "databricks-agents>=1.10.1" "mlflow[databricks]>=3.1"
 
 # COMMAND ----------
 
-# CELL M.0
+# DBTITLE 1,Restart Python to load the installed packages
 dbutils.library.restartPython()
 
 # COMMAND ----------
 
-# CELL M.1 — Configuration and parameters
+# DBTITLE 1,Parameters and configuration
 import time
 import mlflow
 import pyspark.sql.functions as F
@@ -76,7 +78,7 @@ except Exception:
 
 # COMMAND ----------
 
-# CELL M.1b — Create missing destinations and repair those without trace tables
+# DBTITLE 1,Destinations — create missing experiments, repair those without trace tables
 def tables_present(prefix):
     return sum(spark.catalog.tableExists(f"{TRACES_CATALOG}.{TRACES_SCHEMA}.{prefix}_{s}") for s in OTEL_SUFFIXES)
 
@@ -100,7 +102,7 @@ if REPAIR:
 
 # COMMAND ----------
 
-# CELL M.2 — Pre-flight checks (the job fails here if a destination is not ready)
+# DBTITLE 1,Pre-flight checks — the job fails here if a destination is not ready
 TARGETS, problems = {}, []
 for prefix in TO_MIGRATE:
     src = mlflow.get_experiment(ALL_SOURCES[prefix])
@@ -118,7 +120,7 @@ if problems:
 
 # COMMAND ----------
 
-# CELL M.3 — Explicit SELECT + MODIFY grants for the running identity (required by the migration)
+# DBTITLE 1,Grants — explicit SELECT and MODIFY for the running identity (required by the migration)
 for prefix in TO_MIGRATE:
     for s in OTEL_SUFFIXES:
         table = f"{TRACES_CATALOG}.{TRACES_SCHEMA}.{prefix}_{s}"
@@ -130,7 +132,7 @@ print("Grants checked.")
 
 # COMMAND ----------
 
-# CELL M.4 — Migration
+# DBTITLE 1,Migration
 from databricks.migrations.migrate_traces_to_uc import run
 
 kwargs = {}
@@ -150,7 +152,7 @@ for prefix in TO_MIGRATE:
 
 # COMMAND ----------
 
-# CELL M.5 — Verification (the job fails if any migration failed)
+# DBTITLE 1,Verification — trace counts, skipped traces; the job fails if any migration failed
 for prefix in TO_MIGRATE:
     spans = f"{TRACES_CATALOG}.{TRACES_SCHEMA}.{prefix}_otel_spans"
     try:
