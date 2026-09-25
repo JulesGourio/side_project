@@ -6,6 +6,16 @@
   in contents or file names. Resource names that contain a version (e.g. the agent `qualibot_ALL_v2`) are kept as is.
 - Replies to the user: in French, starting with a one- or two-sentence summary of what is being done.
 
+## Working mode with Claude Code
+- Claude Code has NO access to Databricks. The user runs the notebooks and jobs, then sends back outputs, table
+  extracts (CSV / JSON / `DESCRIBE TABLE`) or screenshots. Never claim something ran in Databricks; state what was
+  only tested locally with stubs.
+- Target quality bar: everything visible and linked in MLflow — Runs, Traces, Datasets (golden dataset linked to
+  the runs), Judges / Scorers (every scorer registered), clean professional notebooks (no draft cells, no dead code).
+- Replies: first one or two sentences saying what is being done, then details. Short, no unnecessary narration.
+- The repository currently holds the files flat at its root; the bundle paths below (`utils/...`, `resources/...`)
+  are where they live in the deployed Databricks bundle.
+
 ## Repository layout (evaluation and quality)
 | Path | Purpose |
 |---|---|
