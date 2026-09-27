@@ -4,8 +4,9 @@
 # endpoints) with MLflow judges and scorers registered in the scoring experiment: 4 LLM judges per
 # turn (question intent, answer type and completeness, relevance, language), plus the user reaction
 # when the user wrote again, 2 retrieval judges on the cited documents' excerpts (groundedness,
-# missed answer) and the safety judge on a 10% sample, plus code scorers. Writes the documented tables uat_proj.qualibot.chat_quality_scores,
-# chat_quality_assessments and chat_quality_scoring_runs, and the dashboard views v_chat_quality_*.
+# missed answer) and the safety judge on a 10% sample, plus code scorers. Writes the documented
+# tables uat_proj.qualibot.chat_quality_scores, chat_quality_assessments and chat_quality_scoring_runs,
+# and the dashboard views v_chat_quality_*.
 #
 # Notebook: utils/quality_monitoring/Score_Production_QA.py
 #   base_parameters: source_schema / output_schema / experiment_path / judge_endpoint, plus test_limit,

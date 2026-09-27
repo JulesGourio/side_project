@@ -7,7 +7,7 @@ Working conventions, environment and project status: see `CLAUDE.md`.
 |---|---|---|
 | `Build_Golden_Dataset.py` | evaluation experiment (Datasets tab) | the golden dataset `uat_landingzone.qualibot.qualibot_eval_golden` (20-30 reviewed cases) |
 | `Evaluate_Knowledge_Assistant.py` | `.../qualibot-traces/trace_eval_all_v2` (traces in Unity Catalog) | one run per evaluation, one trace per case, 10 LLM judges and 3 code scorers registered, the golden dataset linked to every run |
-| `Score_Production_QA.py` (job D_3) | `/Shared/qualibot-quality-scoring` | one run per scoring run, one trace per production turn, 10 LLM judges and 2 code scorers registered |
+| `Score_Production_QA.py` (job D_3) | `/Shared/qualibot-quality-scoring` | one run per scoring run, one trace per production turn, 8 LLM judges and 2 code scorers registered (about 6 judge calls per turn) |
 | `Migrate_KA_Traces_To_UC.py` (job D_2) | `.../qualibot-traces/trace_ka_*` | the assistants' own traces, copied to Unity Catalog |
 
 The scorers `relevance`, `language_match`, `groundedness`, `missed_answer` and `reference_integrity` are identical in

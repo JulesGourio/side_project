@@ -38,7 +38,8 @@
   `RETRIEVER` step (`cited_document_excerpts`) and return no assessment when there is none. The excerpts are a subset of
   the documents: a claim absent from them is "not verifiable", not "not supported".
 - Judges are skipped when not applicable: `user_reaction` only when the user wrote again (otherwise `no_next_turn`,
-  free), retrieval judges only when the answer cites indexed documents. Scorers are registered again only when their
+  free), retrieval judges only when the answer cites indexed documents, `safety` on a stable 10% sample of the turns;
+  `answer_type` also carries the completeness (`answered_full` / `answered_partial`). Scorers are registered again only when their
   fingerprint changes (experiment tag `qualibot.scorers_config_id`).
 - Dashboard data: documented Unity Catalog tables and views in `uat_proj.qualibot` (catalogue in `README.md`,
   "Dashboard data"); rows are replaced by key (`message_id` in production, `run_id` in evaluation).
@@ -98,7 +99,7 @@
 | Component | State |
 |---|---|
 | Trace migration (`D_2_qualibot-traces-sync`) | Deployed in UAT. Manual runs: `trace_test`, then `trace_ka_all_v2`, then `trace_ka_is_v2,trace_ka_as_v2`. Schedule to unpause with `to_migrate: "*"` once validated. |
-| Production scoring (`D_3_qualibot-quality-scoring`) | Registered MLflow scorers (7 to 10 judge calls per turn), tables `chat_quality_*` and 5 views; failure e-mail configured, quality alerts e-mailed only once `fail_on_alert` is "true" ("false" for now); tested end to end locally, not yet run in Databricks. Next run: `dry_run=true`, then `reset_outputs=true` with `test_limit=20`, then a full run, then unpause the schedule. |
+| Production scoring (`D_3_qualibot-quality-scoring`) | Registered MLflow scorers (about 6 judge calls per turn), tables `chat_quality_*` and 5 views; failure e-mail configured, quality alerts e-mailed only once `fail_on_alert` is "true" ("false" for now); tested end to end locally, not yet run in Databricks. Next run: `dry_run=true`, then `reset_outputs=true` with `test_limit=20`, then a full run, then unpause the schedule. |
 | Evaluation notebook | Shared scorers with monitoring, every scorer registered, dataset linked to every run, tables `ka_eval_*` and 3 views; tested end to end locally, not yet run in Databricks. |
 | Golden dataset builder | 20-30 cases, compliance-matrix quota, neighbour expansion by `chunk_index`, flat table `ka_eval_golden_cases`; reuses the existing cache; not yet run in Databricks. |
 
