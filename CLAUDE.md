@@ -88,6 +88,9 @@
 - A cited code absent from the index is not necessarily invented: documents often reference procedures outside the
   corpus. Only codes found neither in the index nor in the cited excerpts are "unverified".
 
+- Deployment: `bitbucket-pipelines.yml`; the custom pipeline `deploy-uat-jobs` deploys the UAT bundle (jobs,
+  notebooks) without redeploying the app.
+
 ## Checks before handing over a change
 - `python -m py_compile` on every modified notebook; `databricks bundle validate -t qualibot-uat`.
 - Run the local tests (`README.md`, "Local tests") on the minimum MLflow version (3.11) and on the latest one, and

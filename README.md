@@ -13,6 +13,12 @@ Working conventions, environment and project status: see `CLAUDE.md`.
 The scorers `relevance`, `language_match`, `groundedness`, `missed_answer` and `reference_integrity` are identical in
 the evaluation and the production monitoring (shared cell of both notebooks), so their results can be compared.
 
+## Deployment (Bitbucket Pipelines)
+
+`bitbucket-pipelines.yml` (repository root of the bundle) holds manual custom pipelines. `deploy-uat-jobs` validates
+and deploys the `qualibot-uat` target without `bundle run doc-compare`: jobs and notebooks are updated, the app is
+neither redeployed nor restarted. It can be run on any branch, which deploys that branch's code to UAT.
+
 ## Dashboard data (Unity Catalog, `uat_proj.qualibot`)
 
 Every table and column carries a Unity Catalog comment. Numeric scores follow one convention everywhere:

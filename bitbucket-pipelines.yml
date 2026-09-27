@@ -1,0 +1,233 @@
+# Bitbucket Pipelines — QualiBOT (latec-compare)
+# =============================================================================
+# Déploiement du Databricks Asset Bundle sur UAT puis PROD.
+#
+# AUTH — chaque step reconstruit son profil (~/.databrickscfg) à partir de
+# variables d'environnement Bitbucket SÉCURISÉES, définies dans un environnement
+# de déploiement Bitbucket (Repository settings ▸ Deployments):
+#
+#   UAT  (environnement "UAT")        : DATABRICKS_TOKEN = PAT du SP job-runner-sa-uat
+#   PROD (environnement "Production") : DATABRICKS_TOKEN = PAT du SP job-runner-sa-prod
+#   DATABRICKS_HOST (optionnel dans chaque env) — sinon le host par défaut est câblé ci-dessous.
+#
+# Les déploiements sont MANUELS (pipelines "custom") : on les déclenche
+# explicitement depuis l'UI Bitbucket (Pipelines ▸ Run pipeline) ou via l'API.
+# Rien ne part automatiquement.
+# =============================================================================
+
+image: python:3.11-slim
+
+definitions:
+  steps:
+    # -----------------------------------------------------------------------
+    # UAT — target qualibot-uat / profil job-runner-sa-uat.
+    # Variables dans l'environnement Bitbucket "UAT" :
+    #   DATABRICKS_TOKEN (secured) — PAT du SP job-runner-sa-uat
+    #   DATABRICKS_HOST  (optional) — défaut: https://dbc-3a17bfce-9e88.cloud.databricks.com
+    # -----------------------------------------------------------------------
+    - step: &deploy-uat
+        name: Deploy bundle to UAT (qualibot-uat)
+        deployment: uat
+        clone:
+          depth: 1
+        script:
+          - apt-get update -qq && apt-get install -y -qq curl unzip >/dev/null
+          - curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+          - databricks version
+          - |
+            if [ -z "$DATABRICKS_TOKEN" ]; then
+              echo "ERREUR: variable DATABRICKS_TOKEN absente (environnement Bitbucket 'UAT')." >&2
+              exit 1
+            fi
+          - |
+            cat > "$HOME/.databrickscfg" <<EOF
+            [job-runner-sa-uat]
+            host  = ${DATABRICKS_HOST:-https://dbc-3a17bfce-9e88.cloud.databricks.com}
+            token = ${DATABRICKS_TOKEN}
+            EOF
+          - chmod 600 "$HOME/.databrickscfg"
+          - databricks current-user me -p job-runner-sa-uat
+          - python3 utils/deploy/render_target_config_env.py uat
+          - databricks bundle validate -t qualibot-uat -p job-runner-sa-uat
+          - databricks bundle deploy   -t qualibot-uat -p job-runner-sa-uat
+          - databricks bundle run doc-compare -t qualibot-uat -p job-runner-sa-uat
+
+    # -----------------------------------------------------------------------
+    # UAT, jobs and notebooks only — target qualibot-uat / profile job-runner-sa-uat.
+    # Same as deploy-uat without "bundle run doc-compare": the jobs, notebooks and
+    # other resources of the target are updated, but the app is neither redeployed
+    # nor restarted (its running code stays the one of the last deploy-uat).
+    # Can be run on any branch (Pipelines ▸ Run pipeline ▸ branch ▸ deploy-uat-jobs).
+    # -----------------------------------------------------------------------
+    - step: &deploy-uat-jobs
+        name: Deploy jobs and notebooks to UAT, app untouched (qualibot-uat)
+        deployment: uat
+        clone:
+          depth: 1
+        script:
+          - apt-get update -qq && apt-get install -y -qq curl unzip >/dev/null
+          - curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+          - databricks version
+          - |
+            if [ -z "$DATABRICKS_TOKEN" ]; then
+              echo "ERROR: DATABRICKS_TOKEN is missing (Bitbucket environment 'UAT')." >&2
+              exit 1
+            fi
+          - |
+            cat > "$HOME/.databrickscfg" <<EOF
+            [job-runner-sa-uat]
+            host  = ${DATABRICKS_HOST:-https://dbc-3a17bfce-9e88.cloud.databricks.com}
+            token = ${DATABRICKS_TOKEN}
+            EOF
+          - chmod 600 "$HOME/.databrickscfg"
+          - databricks current-user me -p job-runner-sa-uat
+          - python3 utils/deploy/render_target_config_env.py uat
+          - databricks bundle validate -t qualibot-uat -p job-runner-sa-uat
+          - databricks bundle deploy   -t qualibot-uat -p job-runner-sa-uat
+
+    # -----------------------------------------------------------------------
+    # UAT-TEST — target qualibot-uat-test / profil job-runner-sa-uat (même SP
+    # que deploy-uat — a CAN_MANAGE sur l'app qualibot-uat-test, confirmé
+    # 2026-08-19). Cible jetable, isolée (own app, own Lakebase doccompare_test)
+    # — pas besoin d'environnement Bitbucket dédié, réutilise "UAT".
+    # -----------------------------------------------------------------------
+    - step: &deploy-uat-test
+        name: Deploy bundle to UAT-TEST (qualibot-uat-test)
+        deployment: uat
+        clone:
+          depth: 1
+        script:
+          - apt-get update -qq && apt-get install -y -qq curl unzip >/dev/null
+          - curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+          - databricks version
+          - |
+            if [ -z "$DATABRICKS_TOKEN" ]; then
+              echo "ERREUR: variable DATABRICKS_TOKEN absente (environnement Bitbucket 'UAT')." >&2
+              exit 1
+            fi
+          - |
+            cat > "$HOME/.databrickscfg" <<EOF
+            [job-runner-sa-uat]
+            host  = ${DATABRICKS_HOST:-https://dbc-3a17bfce-9e88.cloud.databricks.com}
+            token = ${DATABRICKS_TOKEN}
+            EOF
+          - chmod 600 "$HOME/.databrickscfg"
+          - databricks current-user me -p job-runner-sa-uat
+          - python3 utils/deploy/render_target_config_env.py uat-test
+          - databricks bundle validate -t qualibot-uat-test -p job-runner-sa-uat
+          - databricks bundle deploy   -t qualibot-uat-test -p job-runner-sa-uat
+          - databricks bundle run doc-compare -t qualibot-uat-test -p job-runner-sa-uat
+
+    # -----------------------------------------------------------------------
+    # PROD — target qualibot-prod / profil job-runner-sa-prod.
+    # Variables dans l'environnement Bitbucket "Production" :
+    #   DATABRICKS_TOKEN (secured) — PAT du SP job-runner-sa-prod
+    #   DATABRICKS_HOST  (optional) — défaut: https://dbc-77b87d5a-6bcb.cloud.databricks.com
+    # -----------------------------------------------------------------------
+    - step: &deploy-prod
+        name: Deploy bundle to PROD (qualibot-prod)
+        deployment: production
+        clone:
+          depth: 1
+        script:
+          - apt-get update -qq && apt-get install -y -qq curl unzip >/dev/null
+          - curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+          - databricks version
+          - |
+            if [ -z "$DATABRICKS_TOKEN" ]; then
+              echo "ERREUR: variable DATABRICKS_TOKEN absente (environnement Bitbucket 'Production')." >&2
+              exit 1
+            fi
+          - |
+            cat > "$HOME/.databrickscfg" <<EOF
+            [job-runner-sa-prod]
+            host  = ${DATABRICKS_HOST:-https://dbc-77b87d5a-6bcb.cloud.databricks.com}
+            token = ${DATABRICKS_TOKEN}
+            EOF
+          - chmod 600 "$HOME/.databrickscfg"
+          - databricks current-user me -p job-runner-sa-prod
+          - python3 utils/deploy/render_target_config_env.py prod
+          - databricks bundle validate -t qualibot-prod -p job-runner-sa-prod
+          - databricks bundle deploy   -t qualibot-prod -p job-runner-sa-prod
+          - databricks bundle run doc-compare -t qualibot-prod -p job-runner-sa-prod
+
+    # -----------------------------------------------------------------------
+    # One-off UAT -> PROD data migration (docling models volume + Lakebase).
+    # Runs entirely as job-runner-sa-uat / job-runner-sa-prod — no personal
+    # login role needed on either side. Staging files pass between the two
+    # steps via Bitbucket artifacts (deleted with the pipeline run).
+    # -----------------------------------------------------------------------
+    - step: &export-from-uat
+        name: "Sync prod data (1/2): export from UAT"
+        deployment: uat
+        clone:
+          depth: 1
+        script:
+          - apt-get update -qq && apt-get install -y -qq curl unzip >/dev/null
+          - curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+          - pip install -q psycopg2-binary databricks-sdk
+          - |
+            if [ -z "$DATABRICKS_TOKEN" ]; then
+              echo "ERREUR: variable DATABRICKS_TOKEN absente (environnement Bitbucket 'UAT')." >&2
+              exit 1
+            fi
+          - |
+            cat > "$HOME/.databrickscfg" <<EOF
+            [job-runner-sa-uat]
+            host  = ${DATABRICKS_HOST:-https://dbc-3a17bfce-9e88.cloud.databricks.com}
+            token = ${DATABRICKS_TOKEN}
+            EOF
+          - chmod 600 "$HOME/.databrickscfg"
+          - databricks fs cp -r dbfs:/Volumes/uat_landingzone/qualibot/docling_models staging/docling_models --profile job-runner-sa-uat
+          - python3 utils/databricks_ops/lakebase_sync/export_lakebase_to_json.py --profile job-runner-sa-uat --out-dir staging/lakebase
+        artifacts:
+          - staging/**
+
+    - step: &import-to-prod
+        name: "Sync prod data (2/2): import to PROD"
+        deployment: production
+        clone:
+          depth: 1
+        script:
+          - apt-get update -qq && apt-get install -y -qq curl unzip >/dev/null
+          - curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+          - pip install -q psycopg2-binary databricks-sdk
+          - |
+            if [ -z "$DATABRICKS_TOKEN" ]; then
+              echo "ERREUR: variable DATABRICKS_TOKEN absente (environnement Bitbucket 'Production')." >&2
+              exit 1
+            fi
+          - |
+            cat > "$HOME/.databrickscfg" <<EOF
+            [job-runner-sa-prod]
+            host  = ${DATABRICKS_HOST:-https://dbc-77b87d5a-6bcb.cloud.databricks.com}
+            token = ${DATABRICKS_TOKEN}
+            EOF
+          - chmod 600 "$HOME/.databrickscfg"
+          - databricks fs cp -r staging/docling_models dbfs:/Volumes/prod_landingzone/qualibot/docling_models --overwrite --profile job-runner-sa-prod
+          - python3 utils/databricks_ops/lakebase_sync/import_lakebase_from_json.py --profile job-runner-sa-prod --in-dir staging/lakebase
+
+pipelines:
+  # Déclenchement MANUEL depuis l'UI Bitbucket (UAT d'abord, puis PROD).
+  custom:
+    deploy-uat:
+      - step: *deploy-uat
+    deploy-uat-jobs:
+      - step: *deploy-uat-jobs
+    deploy-uat-test:
+      - step: *deploy-uat-test
+    deploy-prod:
+      - step: *deploy-prod
+    sync-prod-data:
+      - step: *export-from-uat
+      - step: *import-to-prod
+
+  # Sur main : déploie UAT automatiquement, puis PROD sur déclenchement MANUEL.
+  # (Bitbucket interdit un 1er step manuel — d'où le step UAT auto en amont,
+  # qui sert aussi de porte de promotion UAT -> PROD.)
+  branches:
+    main:
+      - step: *deploy-uat
+      - step:
+          <<: *deploy-prod
+          trigger: manual
