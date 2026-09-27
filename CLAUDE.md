@@ -80,6 +80,8 @@
 - Built-in retrieval judges raise an error on a trace without a `RETRIEVER` span and judge an empty span as
   unsupported: wrap them in a `@scorer` that returns None when there are no excerpts.
 - Assessments in error have a None value: never map it to a score (it is not "none").
+- Never put the user's next message in the evaluation inputs: the judges read it as the question (every answer then
+  looks off-topic). It is a trace tag, read only by `user_reaction`. The built-in `Safety` judge takes `outputs` only.
 - Reading traces stored in Unity Catalog requires `MLFLOW_TRACING_SQL_WAREHOUSE_ID`.
 - An MLflow experiment's parent folder must exist (`w.workspace.mkdirs`).
 - Document codes: compare with a key insensitive to language suffix (`_FR`, `.FR`, `_GB`, `_BG`…), separators, case
@@ -103,7 +105,7 @@
 | Component | State |
 |---|---|
 | Trace migration (`D_2_qualibot-traces-sync`) | Deployed in UAT. Manual runs: `trace_test`, then `trace_ka_all_v2`, then `trace_ka_is_v2,trace_ka_as_v2`. Schedule to unpause with `to_migrate: "*"` once validated. |
-| Production scoring (`D_3_qualibot-quality-scoring`) | Registered MLflow scorers (about 6 judge calls per turn), tables `chat_quality_*` and 5 views; failure e-mail configured, quality alerts e-mailed only once `fail_on_alert` is "true" ("false" for now); tested end to end locally, not yet run in Databricks. Test run on 20 turns done in UAT; `reset_outputs=true` replaces the tables only once the new scores are written. Next: review the verdicts of the 20 test turns (7 `error_or_empty`), then score the backlog, then unpause the schedule. |
+| Production scoring (`D_3_qualibot-quality-scoring`) | Registered MLflow scorers (about 6 judge calls per turn), tables `chat_quality_*` and 5 views; failure e-mail configured, quality alerts e-mailed only once `fail_on_alert` is "true" ("false" for now); tested end to end locally, not yet run in Databricks. Test run on 20 turns done in UAT; `reset_outputs=true` replaces the tables only once the new scores are written. The first 20-turn run showed the judges reading the user's next message as the question (13 off_topic, 7 error_or_empty): fixed. Next: re-run the 20 turns (`reset_outputs=true`, `test_limit=20`), review the verdicts, then score the backlog, then unpause the schedule. |
 | Evaluation notebook | Shared scorers with monitoring, every scorer registered, dataset linked to every run, tables `ka_eval_*` and 3 views; tested end to end locally, not yet run in Databricks. |
 | Golden dataset builder | 20-30 cases, compliance-matrix quota, neighbour expansion by `chunk_index`, flat table `ka_eval_golden_cases`; reuses the existing cache; not yet run in Databricks. |
 

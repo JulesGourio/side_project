@@ -14,7 +14,12 @@ RESET = len(sys.argv) > 1 and sys.argv[1] == "reset"   # tables already exist: r
 work = tempfile.mkdtemp(prefix="scoring_test_"); os.chdir(work)
 mlflow.set_tracking_uri(f"sqlite:///{work}/mlflow.db")
 
+LEAKS = []   # judges other than user_reaction must never see the user's next message
+
+
 def decide(name, text):
+    if name != "user_reaction" and "c'est faux" in text:
+        LEAKS.append(name)
     if name == "question_intent": return "out_of_scope" if "courses" in text else "rule_requirement"
     if name == "answer_type":
         if "Hors p" in text: return "out_of_scope_refusal"
@@ -112,6 +117,8 @@ if not DRY:
     run = mlflow.get_run(ns["MLFLOW_RUN_ID"])
     print("dataset input:", [d.dataset.name for d in run.inputs.dataset_inputs])
     print("metrics:", {k: v for k, v in run.data.metrics.items() if k.startswith(("run/bad", "reason/", "bad_rate"))})
+    assert not LEAKS, f"next user message visible to: {sorted(set(LEAKS))}"
+    print("next user message hidden from the other judges: ok")
     print("judge calls by name:", pd.Series([c[0] for c in calls]).value_counts().to_dict())
 if os.environ.get("SQL_DUMP"):
     sql.dump(os.environ["SQL_DUMP"])

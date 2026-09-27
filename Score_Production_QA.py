@@ -196,8 +196,8 @@ It must answer only from those documents, cite them, answer in the user's langua
 not in the documentation.
 
 {{ inputs }} holds `messages`, the conversation as the assistant saw it (oldest first; the last user message is the
-question). {{ outputs }} is the assistant answer under evaluation. Write the rationale in English, in one or two
-sentences.
+question); any other field of the inputs is an identifier to ignore. {{ outputs }} is the assistant answer under
+evaluation. Write the rationale in English, in one or two sentences.
 """
 
 SHARED_JUDGES = {
@@ -244,10 +244,11 @@ def groundedness(inputs, outputs, trace):
 user's question and EXCERPTS of the documents the answer cites; {{ outputs }} is the answer.
 List mentally the answer's key factual claims (values, thresholds, deadlines, roles, steps, document identities,
 definitions), ignoring greetings, generic advice and questions to the user. The excerpts are only a SUBSET of the
-documents: a claim absent from the excerpts is not verifiable, which is NOT a contradiction.
+documents: a claim absent from the excerpts is not verifiable, which is NOT a contradiction and does NOT lower the
+verdict.
 Return:
-- supported: every verifiable claim is stated by an excerpt;
-- partially_supported: some claims are only partly supported or close but not exact;
+- supported: every claim that the excerpts cover is stated by them, even if other claims cannot be checked;
+- partially_supported: a claim that the excerpts cover is only partly supported, or close but not exact;
 - not_supported: at least one claim is contradicted by the excerpts, or the excerpts of that document clearly show it
   does not say this.
 Write the rationale in English and name the unsupported claims, if any.""",
@@ -538,27 +539,29 @@ Classify the answer:
 - not_found: says the documentation does not contain the information;
 - out_of_scope_refusal: declines an off-topic request;
 - clarification_request: asks the user to clarify instead of answering;
-- error_or_empty: error message, empty or unusable answer."""),
+- error_or_empty: technical error message, or empty or truncated answer. An answer that addresses another question
+  is still classified by what it does (answered_full, answered_partial…): relevance is judged separately."""),
 }
 
 
 @scorer(name="user_reaction", description="Implicit feedback carried by the user's next message: no_next_turn, moves_on, "
                                           "follow_up, rephrase_same_question, correction_or_complaint.")
 def user_reaction(inputs, outputs, trace):
-    """Classifies the user's next message. Free (no judge call) when the user wrote nothing after the answer."""
+    """Classifies the user's next message (trace tag next_user_message, kept out of the inputs so that the other judges
+    only see the conversation up to the question). Free (no judge call) when the user wrote nothing after the answer."""
     from typing import Literal
 
     from mlflow.entities import Feedback
     from mlflow.genai.judges import make_judge
 
-    next_message = (inputs or {}).get("next_user_message")
+    next_message = (trace.info.tags or {}).get("next_user_message")
     if not next_message:
         return Feedback(value="no_next_turn", rationale="The user wrote nothing after this answer.")
     question = next((m["content"] for m in reversed(inputs["messages"]) if m["role"] == "user"), "")
     judge = make_judge(
         name="user_reaction",
         instructions="""{{ inputs }} holds a user's question to an assistant on quality documentation and the message the
-user wrote right after the assistant's answer, which is {{ outputs }}. Classify that next message:
+user wrote right after the assistant's answer; {{ outputs }} is that answer. Classify the user's next message:
 moves_on (new unrelated question, or thanks); follow_up (natural continuation of the topic); rephrase_same_question
 (asks the same thing again: the answer did not help); correction_or_complaint (says the answer is wrong, incomplete or
 unhelpful). Write the rationale in English, in one sentence.""",
@@ -577,13 +580,13 @@ def citation_count(trace):
 
 @scorer(name="safety", description="No harmful, offensive or leaked content (built-in judge), on a stable 10% sample "
                                    "of the turns.")
-def safety(inputs, outputs, trace):
+def safety(outputs, trace):
     """Built-in safety judge on the sampled turns only (trace tag safety_sample); no assessment otherwise."""
     from mlflow.genai.scorers import Safety
 
     if (trace.info.tags or {}).get("safety_sample") != "true":
         return None
-    return Safety(model=trace.info.tags.get("judge_model") or None)(inputs=inputs, outputs=outputs)
+    return Safety(model=trace.info.tags.get("judge_model") or None)(outputs=outputs)
 
 
 def build_scorers(model):
@@ -635,8 +638,7 @@ def turn_verdict(v: dict) -> tuple:
 import inspect
 
 JUDGE_MODEL = f"databricks:/{JUDGE_ENDPOINT}" if JUDGE_ENDPOINT else None
-_sample = {"inputs": {"messages": [{"role": "user", "content": "Quelle est la durée de conservation des enregistrements ?"}],
-                      "next_user_message": None},
+_sample = {"inputs": {"messages": [{"role": "user", "content": "Quelle est la durée de conservation des enregistrements ?"}]},
            "outputs": "Selon **QP-1457**, les enregistrements d'inspection sont conservés 10 ans."}
 
 
@@ -796,7 +798,7 @@ for _, row in pdf_pairs.iterrows():
         "next_user_message": (_text(row.get("next_user_message")) or "")[:800] or None,
         "source_refs": source_refs(row["sources_json"]), "cited_refs": sorted(code_like(raw_answer)),
     }
-RECORDS = [{"inputs": {"messages": t["thread"], "next_user_message": t["next_user_message"], "message_id": mid}}
+RECORDS = [{"inputs": {"messages": t["thread"], "message_id": mid}}
            for mid, t in TURNS.items()]
 
 
@@ -818,7 +820,7 @@ def cited_document_excerpts(query: str, cited_documents: list) -> list:
 
 
 @mlflow.trace(name="qualibot_turn", span_type="AGENT")
-def replay_turn(messages, next_user_message, message_id):
+def replay_turn(messages, message_id):
     """Returns the answer stored in chat_messages; the trace carries the turn's identifiers and cited documents."""
     t = TURNS[message_id]
     row = t["row"]
@@ -826,7 +828,8 @@ def replay_turn(messages, next_user_message, message_id):
             "agent_trace_id": _text(row.get("trace_id")) or "", "judge_model": JUDGE_MODEL or "",
             "judge_config_id": JUDGE_CONFIG_ID, "source_refs": json.dumps(t["source_refs"], ensure_ascii=False),
             "cited_refs": json.dumps(t["cited_refs"], ensure_ascii=False),
-            "safety_sample": str(in_sample(message_id, SAFETY_SAMPLE_RATE, "safety")).lower()}
+            "safety_sample": str(in_sample(message_id, SAFETY_SAMPLE_RATE, "safety")).lower(),
+            "next_user_message": t["next_user_message"] or ""}
     docs = []
     refs = list(dict.fromkeys(t["source_refs"] + t["cited_refs"]))
     if refs and REFS_BY_BASE:

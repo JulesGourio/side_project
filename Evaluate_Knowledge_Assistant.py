@@ -153,8 +153,8 @@ It must answer only from those documents, cite them, answer in the user's langua
 not in the documentation.
 
 {{ inputs }} holds `messages`, the conversation as the assistant saw it (oldest first; the last user message is the
-question). {{ outputs }} is the assistant answer under evaluation. Write the rationale in English, in one or two
-sentences.
+question); any other field of the inputs is an identifier to ignore. {{ outputs }} is the assistant answer under
+evaluation. Write the rationale in English, in one or two sentences.
 """
 
 SHARED_JUDGES = {
@@ -201,10 +201,11 @@ def groundedness(inputs, outputs, trace):
 user's question and EXCERPTS of the documents the answer cites; {{ outputs }} is the answer.
 List mentally the answer's key factual claims (values, thresholds, deadlines, roles, steps, document identities,
 definitions), ignoring greetings, generic advice and questions to the user. The excerpts are only a SUBSET of the
-documents: a claim absent from the excerpts is not verifiable, which is NOT a contradiction.
+documents: a claim absent from the excerpts is not verifiable, which is NOT a contradiction and does NOT lower the
+verdict.
 Return:
-- supported: every verifiable claim is stated by an excerpt;
-- partially_supported: some claims are only partly supported or close but not exact;
+- supported: every claim that the excerpts cover is stated by them, even if other claims cannot be checked;
+- partially_supported: a claim that the excerpts cover is only partly supported, or close but not exact;
 - not_supported: at least one claim is contradicted by the excerpts, or the excerpts of that document clearly show it
   does not say this.
 Write the rationale in English and name the unsupported claims, if any.""",
