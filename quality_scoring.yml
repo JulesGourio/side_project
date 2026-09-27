@@ -1,10 +1,10 @@
 # Quality Scoring Job — Qualibot production turns
 #
 # Scores every assistant turn already answered by the Knowledge Assistants (no call to the KA
-# endpoints) with MLflow judges and scorers registered in the scoring experiment: 7 LLM judges per
-# turn (intent, topic, answer type, relevance, completeness, language, safety), plus the user reaction
-# when the user wrote again and 2 retrieval judges on the cited documents' excerpts (groundedness,
-# missed answer), plus code scorers. Writes the documented tables uat_proj.qualibot.chat_quality_scores,
+# endpoints) with MLflow judges and scorers registered in the scoring experiment: 4 LLM judges per
+# turn (question intent, answer type and completeness, relevance, language), plus the user reaction
+# when the user wrote again, 2 retrieval judges on the cited documents' excerpts (groundedness,
+# missed answer) and the safety judge on a 10% sample, plus code scorers. Writes the documented tables uat_proj.qualibot.chat_quality_scores,
 # chat_quality_assessments and chat_quality_scoring_runs, and the dashboard views v_chat_quality_*.
 #
 # Notebook: utils/quality_monitoring/Score_Production_QA.py
@@ -14,8 +14,8 @@
 #   failure e-mail below (alert e-mails are off while it is "false"; real failures always e-mail)
 #   ("Run now with different parameters").
 #
-# Sizing: ~30 turns/day today, peaks of 300+ expected in prod → 7 to 10 short Luna calls per turn
-# (≈ $0.01 per turn), 4 turns in parallel (MAX_PARALLEL_TURNS in the notebook).
+# Sizing: ~30 turns/day today, peaks of 300+ expected in prod → about 6 short Luna calls per turn
+# (≈ $0.008 per turn), 4 turns in parallel (MAX_PARALLEL_TURNS in the notebook).
 
 targets:
   qualibot-uat:

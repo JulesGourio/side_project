@@ -9,12 +9,11 @@
 # MAGIC ### Scorers
 # MAGIC | Scorer | Type | Values | When |
 # MAGIC |---|---|---|---|
-# MAGIC | `question_intent`, `question_topic` | LLM judge | what the user asks (dashboard breakdowns) | every turn |
-# MAGIC | `answer_type` | LLM judge | answered, partial_answer, not_found, out_of_scope_refusal, clarification_request, error_or_empty | every turn |
+# MAGIC | `question_intent` | LLM judge | what the user asks (dashboard breakdowns) | every turn |
+# MAGIC | `answer_type` | LLM judge | answered_full, answered_partial, not_found, out_of_scope_refusal, clarification_request, error_or_empty (also gives the completeness) | every turn |
 # MAGIC | `relevance` ¹ | LLM judge | yes / no — follow-up requests ("shorter", "remove document X") are judged against the previous turn | every turn |
-# MAGIC | `completeness` | LLM judge | full / partial / none / not_applicable | every turn |
 # MAGIC | `language_match` ¹ | LLM judge | yes / no | every turn |
-# MAGIC | `safety` | built-in LLM judge | yes / no | every turn |
+# MAGIC | `safety` | built-in LLM judge | yes / no | a stable 10% sample of the turns (internal documentation: rarely at risk) |
 # MAGIC | `user_reaction` | LLM judge | implicit feedback carried by the user's next message | when the user wrote again (otherwise `no_next_turn`, free) |
 # MAGIC | `groundedness` ¹ | LLM judge on the `RETRIEVER` step | supported / partially_supported / not_supported — the excerpts are a subset of the documents: absence of evidence is not contradiction | when the answer cites indexed documents |
 # MAGIC | `missed_answer` ¹ | LLM judge on the `RETRIEVER` step | yes when the answer says "not found" (or leaves a part unanswered) while the excerpts contain it | when the answer cites indexed documents |
@@ -317,7 +316,7 @@ SCORE_VALUES = {"yes": 1.0, "no": 0.0, "true": 1.0, "false": 0.0, "full": 1.0, "
                 "supported": 1.0, "partially_supported": 0.5, "not_supported": 0.0,
                 "no_contradiction": 1.0, "contradiction": 0.0, "correct_refusal": 1.0, "answered_anyway": 0.0,
                 "good": 1.0, "acceptable": 0.5, "bad": 0.0, "up": 1.0, "down": 0.0}
-LABEL_SCORERS = {"question_intent", "question_topic", "answer_type", "user_reaction"}   # categorical: no numeric form
+LABEL_SCORERS = {"question_intent", "answer_type", "user_reaction"}   # categorical: no numeric form
 INVERTED_SCORERS = {"missed_answer"}                                                   # "yes" is the failure
 
 
@@ -520,12 +519,13 @@ def classify_refs(cited, excerpt_text: str) -> dict:
 
 # COMMAND ----------
 
-# DBTITLE 1,Production scorers — conversation labels, completeness, safety, user reaction, citation count
-from mlflow.genai.scorers import Safety
-
+# DBTITLE 1,Production scorers — question type, answer type, sampled safety, user reaction, citation count
 INTENTS = ["definition_acronym", "document_lookup", "procedure_howto", "rule_requirement", "requirement_compliance",
            "comparison_multi_doc", "link_or_navigation", "person_or_org", "chitchat_or_meta", "out_of_scope"]
-ANSWER_TYPES = ["answered", "partial_answer", "not_found", "out_of_scope_refusal", "clarification_request", "error_or_empty"]
+ANSWER_TYPES = ["answered_full", "answered_partial", "not_found", "out_of_scope_refusal", "clarification_request",
+                "error_or_empty"]
+COMPLETENESS = {"answered_full": "full", "answered_partial": "partial"}   # other answer types: not_applicable
+SAFETY_SAMPLE_RATE = 0.10              # share of the turns checked by the safety judge (stable sample on message_id)
 
 PRODUCTION_JUDGES = {
     "question_intent": (
@@ -535,19 +535,15 @@ definition_acronym; document_lookup (find a document or template); procedure_how
 deadline, responsibility); requirement_compliance (whether the company complies with a customer or standard requirement,
 and which internal documents demonstrate it); comparison_multi_doc; link_or_navigation; person_or_org (a person, a team,
 an organisation); chitchat_or_meta; out_of_scope."""),
-    "question_topic": (
-        "Topic of the last user message, in 2 to 5 English words.", str, CONTEXT + """
-Give the topic of the last user message in 2 to 5 English words (e.g. "operator qualification", "FAI after site change")."""),
     "answer_type": (
-        "Kind of answer given by the assistant.", Literal[tuple(ANSWER_TYPES)], CONTEXT + """
-Classify the answer: answered; partial_answer; not_found (says the documentation does not contain it);
-out_of_scope_refusal (declines an off-topic request); clarification_request (asks the user to clarify instead of
-answering); error_or_empty."""),
-    "completeness": (
-        "How completely the answer covers the question (full / partial / none / not_applicable).",
-        Literal["full", "partial", "none", "not_applicable"], CONTEXT + """
-How completely does the answer cover the question? full; partial (some parts left unanswered); none;
-not_applicable (refusal, "not found" or clarification request)."""),
+        "Kind of answer, and how completely it covers the question.", Literal[tuple(ANSWER_TYPES)], CONTEXT + """
+Classify the answer:
+- answered_full: answers every part of the question;
+- answered_partial: answers only some parts, or stays vague on a part that was asked;
+- not_found: says the documentation does not contain the information;
+- out_of_scope_refusal: declines an off-topic request;
+- clarification_request: asks the user to clarify instead of answering;
+- error_or_empty: error message, empty or unusable answer."""),
 }
 
 
@@ -584,12 +580,23 @@ def citation_count(trace):
     return len(json.loads((trace.info.tags or {}).get("source_refs", "[]")))
 
 
+@scorer(name="safety", description="No harmful, offensive or leaked content (built-in judge), on a stable 10% sample "
+                                   "of the turns.")
+def safety(inputs, outputs, trace):
+    """Built-in safety judge on the sampled turns only (trace tag safety_sample); no assessment otherwise."""
+    from mlflow.genai.scorers import Safety
+
+    if (trace.info.tags or {}).get("safety_sample") != "true":
+        return None
+    return Safety(model=trace.info.tags.get("judge_model") or None)(inputs=inputs, outputs=outputs)
+
+
 def build_scorers(model):
-    """(LLM judges called for every turn, trace judges called when applicable, code scorers)."""
+    """(LLM judges called for every turn, judges called when applicable, code scorers)."""
     kw = {"model": model} if model else {}
     every_turn = [make_judge(name=n, description=d, feedback_value_type=t, instructions=i, **kw)
-                  for n, (d, t, i) in PRODUCTION_JUDGES.items()] + shared_llm_judges(model) + [Safety(**kw)]
-    return every_turn, [user_reaction, groundedness, missed_answer], [reference_integrity, citation_count]
+                  for n, (d, t, i) in PRODUCTION_JUDGES.items()] + shared_llm_judges(model)
+    return every_turn, [user_reaction, groundedness, missed_answer, safety], [reference_integrity, citation_count]
 
 # COMMAND ----------
 
@@ -612,15 +619,13 @@ def turn_verdict(v: dict) -> tuple:
         bad.append("unsupported_claims")
     elif v.get("groundedness") == "partially_supported":
         warn.append("partially_supported_claims")
-    if at in ("answered", "partial_answer") and v.get("completeness") == "none":
-        bad.append("does_not_answer")
-    elif v.get("completeness") == "partial" or at == "partial_answer":
+    if at == "answered_partial":
         warn.append("incomplete")
     if v.get("reference_integrity") is False:
         warn.append("unverified_reference")
     if v.get("language_match") == "no":
         warn.append("language_mismatch")
-    if at in ("answered", "partial_answer") and intent not in ("out_of_scope", "chitchat_or_meta") \
+    if at in ("answered_full", "answered_partial") and intent not in ("out_of_scope", "chitchat_or_meta") \
             and not v.get("citation_count"):
         warn.append("no_citation")
     if v.get("user_reaction") == "correction_or_complaint":
@@ -778,6 +783,11 @@ def last_user_question(messages: list) -> str:
     return next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
 
 
+def in_sample(key, rate: float, salt: str = "") -> bool:
+    """Stable pseudo-random sample: the same keys are selected at every run."""
+    return int(hashlib.md5(f"{salt}{key}".encode()).hexdigest()[:8], 16) % 10000 < rate * 10000
+
+
 def _text(v):
     return None if v is None or (isinstance(v, float) and v != v) else str(v)
 
@@ -820,7 +830,8 @@ def replay_turn(messages, next_user_message, message_id):
     tags = {"message_id": message_id, "endpoint": str(row["endpoint_name"]), "division": str(row["division"]),
             "agent_trace_id": _text(row.get("trace_id")) or "", "judge_model": JUDGE_MODEL or "",
             "judge_config_id": JUDGE_CONFIG_ID, "source_refs": json.dumps(t["source_refs"], ensure_ascii=False),
-            "cited_refs": json.dumps(t["cited_refs"], ensure_ascii=False)}
+            "cited_refs": json.dumps(t["cited_refs"], ensure_ascii=False),
+            "safety_sample": str(in_sample(message_id, SAFETY_SAMPLE_RATE, "safety")).lower()}
     docs = []
     refs = list(dict.fromkeys(t["source_refs"] + t["cited_refs"]))
     if refs and REFS_BY_BASE:
@@ -852,7 +863,7 @@ def estimated_usage(t: dict) -> tuple:
     prompt_chars = len(json.dumps(t["thread"], ensure_ascii=False)) + len(t["answer"]) + 2500
     retrieval = 2 if (t["source_refs"] or t["cited_refs"]) and REFS_BY_BASE else 0
     reaction = 1 if t["next_user_message"] else 0
-    calls = len(LLM_JUDGES) + retrieval + reaction
+    calls = len(LLM_JUDGES) + retrieval + reaction + SAFETY_SAMPLE_RATE
     tokens_in = (len(LLM_JUDGES) * prompt_chars + retrieval * (EXCERPTS_PER_TURN * EXCERPT_MAX_CHARS + len(t["answer"]))
                  + reaction * 3000) / CHARS_PER_TOKEN
     return calls, tokens_in, calls * OUTPUT_TOKENS_PER_JUDGE_CALL
@@ -867,7 +878,7 @@ if not TURNS:
 elif DRY_RUN:
     usage = [estimated_usage(t) for t in TURNS.values()]
     calls, t_in, t_out = (sum(u[i] for u in usage) for i in range(3))
-    print(f"DRY RUN (nothing is scored or written) · {len(TURNS)} turns · ~{calls} judge calls "
+    print(f"DRY RUN (nothing is scored or written) · {len(TURNS)} turns · ~{calls:.0f} judge calls "
           f"({calls / len(TURNS):.1f} per turn) · ~{t_in / 1e6:.2f}M in / ~{t_out / 1e6:.2f}M out tokens · "
           f"≈ ${cost_usd(t_in, t_out):.2f}")
 else:
@@ -898,9 +909,7 @@ REQUIRED = {"answer_type", "relevance", "question_intent"}      # without them t
 
 
 def in_calibration_sample(message_id) -> bool:
-    """Stable pseudo-random sample (same turns selected at every run)."""
-    h = int(hashlib.md5(str(message_id).encode()).hexdigest()[:8], 16)
-    return (h % 10000) < HUMAN_REVIEW_SAMPLE_RATE * 10000
+    return in_sample(message_id, HUMAN_REVIEW_SAMPLE_RATE)
 
 
 def _yes(v):
@@ -937,15 +946,15 @@ def build_record(mid: str) -> dict:
         "unindexed_refs": json.loads(tags.get("unindexed_refs", "[]")),
         "unverified_refs": json.loads(tags.get("unverified_refs", "[]")),
         "feedback_vote": vote, "feedback_comment": _text(row.get("feedback_comment")),
-        "question_intent": v.get("question_intent"), "question_topic": v.get("question_topic"),
+        "question_intent": v.get("question_intent"),
         "in_scope": None if not v.get("question_intent") else
                     ("no" if v["question_intent"] in ("out_of_scope", "chitchat_or_meta") else "yes"),
         "is_follow_up": sum(m["role"] == "user" for m in t["thread"]) > 1,
         "answer_type": v.get("answer_type"),
         "relevance__value": _yes(v.get("relevance")), "relevance__rationale": why.get("relevance"),
-        "completeness_level": v.get("completeness"),
-        "completeness__value": None if v.get("completeness") is None else v["completeness"] in ("full", "not_applicable"),
-        "completeness__rationale": why.get("completeness"),
+        "answer_type__rationale": why.get("answer_type"),
+        "completeness_level": None if not v.get("answer_type") else COMPLETENESS.get(v["answer_type"], "not_applicable"),
+        "completeness__value": None if not v.get("answer_type") else v["answer_type"] != "answered_partial",
         "language_match__value": _yes(v.get("language_match")), "language_match__rationale": why.get("language_match"),
         "safety__value": _yes(v.get("safety")), "safety__rationale": why.get("safety"),
         "grounding_source": "cited_documents" if ground else "none", "groundedness_level": ground,
@@ -1033,18 +1042,17 @@ SCORES_COLUMNS = [
     ("feedback_vote", S, "User vote on the answer: up, down or NULL"),
     ("feedback_comment", S, "User comment attached to the vote"),
     ("question_intent", S, "Judge label: kind of question (definition_acronym, document_lookup, requirement_compliance…)"),
-    ("question_topic", S, "Judge label: topic of the question in 2 to 5 English words"),
     ("in_scope", S, "yes unless the intent is out_of_scope or chitchat_or_meta"),
     ("is_follow_up", B, "The conversation had earlier user messages"),
-    ("answer_type", S, "Judge label: answered, partial_answer, not_found, out_of_scope_refusal, clarification_request, error_or_empty"),
+    ("answer_type", S, "Judge label: answered_full, answered_partial, not_found, out_of_scope_refusal, clarification_request, error_or_empty"),
+    ("answer_type__rationale", S, "Rationale of the answer type judge"),
     ("relevance__value", B, "Judge: the answer addresses the question"),
     ("relevance__rationale", S, "Rationale of the relevance judge"),
-    ("completeness_level", S, "Judge: full, partial, none or not_applicable"),
-    ("completeness__value", B, "completeness_level is full or not_applicable"),
-    ("completeness__rationale", S, "Rationale of the completeness judge"),
+    ("completeness_level", S, "From answer_type: full, partial, or not_applicable (refusal, not found, clarification)"),
+    ("completeness__value", B, "The answer is not partial"),
     ("language_match__value", B, "Judge: the answer is in the language of the question"),
     ("language_match__rationale", S, "Rationale of the language judge"),
-    ("safety__value", B, "Judge: no harmful content"),
+    ("safety__value", B, "Judge: no harmful content; NULL outside the 10% safety sample"),
     ("safety__rationale", S, "Rationale of the safety judge"),
     ("grounding_source", S, "cited_documents when the answer could be checked against excerpts, none otherwise"),
     ("groundedness_level", S, "Judge: supported, partially_supported or not_supported; NULL when nothing could be checked"),

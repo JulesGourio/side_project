@@ -15,12 +15,10 @@ mlflow.set_tracking_uri(f"sqlite:///{work}/mlflow.db")
 
 def decide(name, text):
     if name == "question_intent": return "out_of_scope" if "courses" in text else "rule_requirement"
-    if name == "question_topic": return "records retention"
     if name == "answer_type":
         if "Hors p" in text: return "out_of_scope_refusal"
         if "pas trouv" in text: return "not_found"
-        return "answered"
-    if name == "completeness": return "not_applicable" if ("pas trouv" in text or "Hors" in text) else "full"
+        return "answered_partial" if "APO" in text else "answered_full"
     if name == "groundedness": return "not_supported" if "INVENTED" in text else "supported"
     if name == "missed_answer": return "yes" if "pas trouv" in text else "no"
     if name == "user_reaction": return "correction_or_complaint" if "faux" in text else "no_next_turn"

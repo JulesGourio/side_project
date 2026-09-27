@@ -268,7 +268,7 @@ SCORE_VALUES = {"yes": 1.0, "no": 0.0, "true": 1.0, "false": 0.0, "full": 1.0, "
                 "supported": 1.0, "partially_supported": 0.5, "not_supported": 0.0,
                 "no_contradiction": 1.0, "contradiction": 0.0, "correct_refusal": 1.0, "answered_anyway": 0.0,
                 "good": 1.0, "acceptable": 0.5, "bad": 0.0, "up": 1.0, "down": 0.0}
-LABEL_SCORERS = {"question_intent", "question_topic", "answer_type", "user_reaction"}   # categorical: no numeric form
+LABEL_SCORERS = {"question_intent", "answer_type", "user_reaction"}   # categorical: no numeric form
 INVERTED_SCORERS = {"missed_answer"}                                                   # "yes" is the failure
 
 
