@@ -43,7 +43,8 @@
 # MAGIC   re-scores the turns judged with another configuration.
 # MAGIC - `feedback_to_agent_traces=true` also attaches the verdict to the assistant's own trace (needs CAN_EDIT on the
 # MAGIC   assistants' experiments).
-# MAGIC - Alerts compare each assistant's daily bad-answer rate with its 7-day baseline and can fail the job to trigger its notifications.
+# MAGIC - Alerts compare each assistant's daily bad-answer rate with its 7-day baseline. With `fail_on_alert=true`, a run
+# MAGIC   that raises an alert fails on purpose (after writing every output), so that the job's failure e-mail is sent.
 # MAGIC - A human review queue is built automatically: judge/user disagreements plus a stable random calibration sample.
 
 # COMMAND ----------
@@ -88,6 +89,7 @@ dbutils.widgets.dropdown("dry_run", "false", ["true", "false"])                 
 dbutils.widgets.dropdown("rescore_changed_config", "false", ["true", "false"])    # true = re-score turns judged with another configuration
 dbutils.widgets.dropdown("reset_outputs", "false", ["true", "false"])             # true = drop the output tables before scoring
 dbutils.widgets.dropdown("feedback_to_agent_traces", "false", ["true", "false"])  # true = also attach the verdict to the assistant's trace
+dbutils.widgets.dropdown("fail_on_alert", "false", ["true", "false"])             # true = the run fails on a quality alert (job e-mail)
 dbutils.widgets.text("source_schema", "uat_landingzone.qualibot")                 # chat_messages / chat_feedbacks
 dbutils.widgets.text("output_schema", "uat_proj.qualibot")                        # output tables and views
 dbutils.widgets.text("experiment_path", "/Shared/qualibot-quality-scoring")
@@ -98,6 +100,7 @@ DRY_RUN = dbutils.widgets.get("dry_run") == "true"
 RESCORE_CHANGED = dbutils.widgets.get("rescore_changed_config") == "true"
 RESET_OUTPUTS = dbutils.widgets.get("reset_outputs") == "true"
 FEEDBACK_TO_AGENT_TRACES = dbutils.widgets.get("feedback_to_agent_traces") == "true"
+FAIL_ON_ALERT = dbutils.widgets.get("fail_on_alert") == "true"
 SOURCE_SCHEMA = dbutils.widgets.get("source_schema").strip()
 OUTPUT_SCHEMA = dbutils.widgets.get("output_schema").strip()
 EXPERIMENT_PATH = dbutils.widgets.get("experiment_path").strip()
@@ -135,12 +138,11 @@ HUMAN_REVIEW_SAMPLE_RATE = 0.03        # random calibration sample, on top of ju
 ALERT_MIN_TURNS = 15                   # a day needs at least this many turns to raise an alert
 ALERT_BAD_RATE_DELTA = 0.10            # ... AND a bad-rate increase of at least 10 points vs the 7-day baseline
 ALERT_Z = 2.5                          # ... AND statistically significant (binomial z-score)
-FAIL_JOB_ON_ALERT = False              # True = the job fails on alert → Databricks job notification
 
 TRACE_ID_CANDIDATES = ["trace_id", "mlflow_trace_id", "request_id", "databricks_request_id"]
 LANG_SUFFIXES = ["FR", "GB", "EN", "UK", "CZ", "ES", "DE", "PT", "IT", "MX", "BG", "RO", "PL", "TN"]
 print(f"dry_run={DRY_RUN} · rescore_changed_config={RESCORE_CHANGED} · reset_outputs={RESET_OUTPUTS} · "
-      f"test_limit={TEST_LIMIT} · feedback_to_agent_traces={FEEDBACK_TO_AGENT_TRACES}")
+      f"test_limit={TEST_LIMIT} · feedback_to_agent_traces={FEEDBACK_TO_AGENT_TRACES} · fail_on_alert={FAIL_ON_ALERT}")
 
 # COMMAND ----------
 
@@ -1251,7 +1253,7 @@ if FEEDBACK_TO_AGENT_TRACES and len(df_final):
             ko += 1   # typically: trace in an experiment without CAN_EDIT for the job identity
     print(f"Verdict on the assistant traces: {ok} attached · {ko} failed")
 
-if FAIL_JOB_ON_ALERT and alerts:
+if FAIL_ON_ALERT and alerts:
     raise RuntimeError("Quality alert: " + " | ".join(alerts))
 
 # COMMAND ----------

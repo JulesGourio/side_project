@@ -9,7 +9,9 @@
 #
 # Notebook: utils/quality_monitoring/Score_Production_QA.py
 #   base_parameters: source_schema / output_schema / experiment_path / judge_endpoint, plus test_limit,
-#   dry_run, rescore_changed_config, reset_outputs, feedback_to_agent_traces for ad-hoc runs
+#   dry_run, rescore_changed_config, reset_outputs, feedback_to_agent_traces for ad-hoc runs, and
+#   fail_on_alert: "true" makes a run that raises a quality alert fail on purpose, which sends the
+#   failure e-mail below (alert e-mails are off while it is "false"; real failures always e-mail)
 #   ("Run now with different parameters").
 #
 # Sizing: ~30 turns/day today, peaks of 300+ expected in prod → 7 to 10 short Luna calls per turn
@@ -26,6 +28,11 @@ targets:
 
           # Two overlapping runs would score the same turns twice.
           max_concurrent_runs: 1
+
+          # Failure e-mail: real failures, and quality alerts once fail_on_alert is "true".
+          email_notifications:
+            on_failure:
+              - jules.gourio.external@latecoere.aero
 
           tags:
             project: Qualibot
@@ -61,6 +68,7 @@ targets:
                   rescore_changed_config: "false"
                   reset_outputs: "false"
                   feedback_to_agent_traces: "false"
+                  fail_on_alert: "false"
 
           environments:
             - environment_key: scoring_env

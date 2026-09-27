@@ -98,7 +98,7 @@
 | Component | State |
 |---|---|
 | Trace migration (`D_2_qualibot-traces-sync`) | Deployed in UAT. Manual runs: `trace_test`, then `trace_ka_all_v2`, then `trace_ka_is_v2,trace_ka_as_v2`. Schedule to unpause with `to_migrate: "*"` once validated. |
-| Production scoring (`D_3_qualibot-quality-scoring`) | Registered MLflow scorers (7 to 10 judge calls per turn), tables `chat_quality_*` and 5 views; tested end to end locally, not yet run in Databricks. Next run: `dry_run=true`, then `reset_outputs=true` with `test_limit=20`, then a full run, then unpause the schedule. |
+| Production scoring (`D_3_qualibot-quality-scoring`) | Registered MLflow scorers (7 to 10 judge calls per turn), tables `chat_quality_*` and 5 views; failure e-mail configured, quality alerts e-mailed only once `fail_on_alert` is "true" ("false" for now); tested end to end locally, not yet run in Databricks. Next run: `dry_run=true`, then `reset_outputs=true` with `test_limit=20`, then a full run, then unpause the schedule. |
 | Evaluation notebook | Shared scorers with monitoring, every scorer registered, dataset linked to every run, tables `ka_eval_*` and 3 views; tested end to end locally, not yet run in Databricks. |
 | Golden dataset builder | 20-30 cases, compliance-matrix quota, neighbour expansion by `chunk_index`, flat table `ka_eval_golden_cases`; reuses the existing cache; not yet run in Databricks. |
 
