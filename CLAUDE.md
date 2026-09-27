@@ -110,7 +110,7 @@
 | Component | State |
 |---|---|
 | Trace migration (`D_2_qualibot-traces-sync`) | Deployed in UAT. Manual runs: `trace_test`, then `trace_ka_all_v2`, then `trace_ka_is_v2,trace_ka_as_v2`. Schedule to unpause with `to_migrate: "*"` once validated. |
-| Production scoring (`D_3_qualibot-quality-scoring`) | Registered MLflow scorers (about 6 judge calls per turn), tables `chat_quality_*` and 5 views; failure e-mail configured, quality alerts e-mailed only once `fail_on_alert` is "true" ("false" for now); tested end to end locally, not yet run in Databricks. Test run on 20 turns done in UAT; `reset_outputs=true` replaces the tables only once the new scores are written. Two 20-turn runs reviewed with the user: judges reading the next message as the question, trace tags too long (4 turns not scored), relevance/answer_type judging evidence, excerpts missing for some cited documents: all fixed. Next: re-run the 20 turns (`reset_outputs=true`, `test_limit=20`), review the verdicts, then score the backlog (`test_limit=300` per run), then unpause the schedule. |
+| Production scoring (`D_3_qualibot-quality-scoring`) | Registered MLflow scorers (about 6 judge calls per turn), tables `chat_quality_*` and 5 views; failure e-mail configured, quality alerts e-mailed only once `fail_on_alert` is "true" ("false" for now); tested end to end locally, not yet run in Databricks. Test run on 20 turns done in UAT; `reset_outputs=true` replaces the tables only once the new scores are written. Three 20-turn runs reviewed with the user; the third one is validated (20/20 scored, no scorer error, every bad verdict traced to a real assistant error). Next: score the backlog (`test_limit=300` per run, about 5 runs), then unpause the schedule. |
 | Evaluation notebook | Shared scorers with monitoring, every scorer registered, dataset linked to every run, tables `ka_eval_*` and 3 views; tested end to end locally, not yet run in Databricks. |
 | Golden dataset builder | 20-30 cases, compliance-matrix quota, neighbour expansion by `chunk_index`, flat table `ka_eval_golden_cases`; reuses the existing cache; not yet run in Databricks. |
 
@@ -125,6 +125,16 @@
 - Production traffic: about half of the questions come from one use case, filling customer compliance matrices
   (e.g. Dassault requirements: "is Latécoère compliant, which document proves it?"). Its bad-answer rate is high, and
   the assistant tends to assert compliance instead of citing the documents that address the requirement.
+
+### Findings from the validated production scoring run (20 recent turns, mostly ALL)
+- 30% bad, 40% acceptable, 30% good. Every bad verdict comes from claims contradicted by the cited documents:
+  - compliance-matrix answers ("idem pour <Dassault requirement>") assert "Oui, Latécoère répond à cette exigence" and
+    cite documents that do not say it (Q0070MI, Q0406MI, MI-1226 instead of Q0258MM, a Quality Manual clause about
+    authorities presented as a Dassault right, a wrong title for Q0408QP);
+  - SAP procedural details invented (COHV and Winshuttle mass treatment, exception message numbers confused with user
+    statuses) and a cancelled instruction (IAQ 04 21 01) presented as current.
+- Frequent warnings: answers that leave out details the cited documents contain (repair case of NCR closure, LBG listed
+  among the applicable sites), and an English answer to a Bulgarian question.
 
 ### Open questions (to ask the user or an expert)
 - Expert: unspecified bore tolerance on Airbus drawings — NSA2010 / ABS1707 (golden) or NSA2110 (assistant)?
