@@ -110,7 +110,8 @@ PRODUCTION_ASSESSMENTS_TABLE = f"{OUTPUT_SCHEMA}.chat_quality_assessments"   # w
 VS_INDEX = "uat_landingzone.qualibot.chunks_index_v1"
 VS_COLUMNS = ["REF", "chunk_text", "semantic_headers"]
 REF_SOURCE_TABLE = None          # source table of the index; None = read from the index definition
-EXCERPTS_PER_CASE = 10
+EXCERPTS_PER_DOCUMENT = 3        # excerpts per cited document
+MAX_DOCUMENTS_CHECKED = 6        # cited documents checked per case
 EXCERPT_MAX_CHARS = 1500
 
 # Optional case metadata (question type, difficulty, expected answerability) written by the dataset builder
@@ -133,6 +134,7 @@ from typing import Literal
 
 import mlflow
 from mlflow import MlflowClient
+from mlflow.entities import Document
 from mlflow.genai.judges import make_judge
 from mlflow.genai.scorers import delete_scorer, scorer
 from pyspark.sql.types import ArrayType, BooleanType, DoubleType, LongType, StringType
@@ -164,7 +166,8 @@ SHARED_JUDGES = {
 Does the answer address what the user asked, given the whole conversation? When the last user message asks to modify,
 correct or restate the previous answer ("remove document X", "shorter", "same for Y"), judge whether the answer applies
 that request. An appropriate refusal of an out-of-scope request, or a justified "not found", counts as relevant.
-Return yes or no."""),
+Judge only whether the content addresses the request: the language of the answer, the correctness of its facts and the
+strength of its evidence are judged separately and must not lower this verdict. Return yes or no."""),
     "language_match": (
         "The answer is written in the language of the user's last message.",
         CONTEXT + """
@@ -246,23 +249,58 @@ was missed, if anything.""",
 def reference_integrity(trace):
     """True when every cited document code exists: resolved typos (zero padding) and documents outside the corpus
     mentioned in the excerpts are accepted; codes found nowhere are reported as unverified."""
-    import json
-
     from mlflow.entities import Feedback
 
-    tags = trace.info.tags or {}
-    unverified = json.loads(tags.get("unverified_refs", "[]"))
+    context = next((s.outputs for s in trace.search_spans(name="answer_context") if isinstance(s.outputs, dict)), {})
+    unverified = context.get("unverified_refs") or []
     notes = []
-    if json.loads(tags.get("approximate_refs", "[]")):
-        notes.append(f"resolved: {json.loads(tags['approximate_refs'])}")
-    if json.loads(tags.get("unindexed_refs", "[]")):
-        notes.append(f"outside the corpus: {json.loads(tags['unindexed_refs'])}")
+    if context.get("approximate_refs"):
+        notes.append(f"resolved: {context['approximate_refs']}")
+    if context.get("unindexed_refs"):
+        notes.append(f"outside the corpus: {context['unindexed_refs']}")
     if unverified:
         notes.append(f"unverified: {unverified}")
     return Feedback(value=not unverified, rationale="; ".join(notes) or "all cited codes exist")
 
 
 SHARED_TRACE_SCORERS = [groundedness, missed_answer, reference_integrity]
+
+
+# ── Trace steps read by the scorers ──
+def record_answer_context(context: dict):
+    """Variable-length data of a turn or case (document lists, next user message, errors), stored as the trace step
+    answer_context: trace tags are limited in length and a tag that is too long makes the whole trace fail."""
+    with mlflow.start_span(name="answer_context", span_type="UNKNOWN") as span:
+        span.set_outputs(context)
+
+
+def answer_context(trace) -> dict:
+    return next((s.outputs for s in trace.search_spans(name="answer_context") if isinstance(s.outputs, dict)), {})
+
+
+@mlflow.trace(name="cited_document_excerpts", span_type="RETRIEVER")
+def cited_document_excerpts(query: str, cited_documents: list) -> list:
+    """Excerpts of the cited documents most related to the question and the answer: up to EXCERPTS_PER_DOCUMENT
+    excerpts for each of the first MAX_DOCUMENTS_CHECKED cited documents (Vector Search, filtered on each document and
+    its language variants), so that every checked document is represented. Shown as a RETRIEVER step so that the
+    retrieval judges can use them and they are readable in the trace."""
+    documents = {}
+    for ref in cited_documents:
+        key = base_ref(ref)
+        if len(key) >= 4 and key in REFS_BY_BASE:
+            documents.setdefault(key, sorted(REFS_BY_BASE[key]))
+    excerpts = []
+    for variants in list(documents.values())[:MAX_DOCUMENTS_CHECKED]:
+        res = w.vector_search_indexes.query_index(
+            index_name=VS_INDEX, columns=VS_COLUMNS, query_text=query[:2000], query_type="HYBRID",
+            num_results=EXCERPTS_PER_DOCUMENT, filters_json=json.dumps({"REF": variants}))
+        cols = [c.name for c in res.manifest.columns]
+        rows = [dict(zip(cols, r)) for r in ((res.result.data_array if res.result else None) or [])]
+        excerpts += [Document(id=f"{r.get('REF')}#{len(excerpts) + i}",
+                              page_content=str(r.get("chunk_text") or "")[:EXCERPT_MAX_CHARS],
+                              metadata={"doc_uri": r.get("REF"), "section": str(r.get("semantic_headers") or "")[:200]})
+                     for i, r in enumerate(rows)]
+    return excerpts
 
 # ── Numeric form of a verdict: 1 = pass, 0 = fail, 0.5 = partial; counts and durations as is; NULL for labels ──
 SCORE_VALUES = {"yes": 1.0, "no": 0.0, "true": 1.0, "false": 0.0, "full": 1.0, "partial": 0.5, "none": 0.0,
@@ -538,9 +576,6 @@ def classify_refs(cited, excerpt_text: str) -> dict:
 # COMMAND ----------
 
 # DBTITLE 1,Traced application — assistant call and retrieval of the cited documents' excerpts
-from mlflow.entities import Document
-
-
 def _extract_text(resp) -> str:
     if isinstance(resp, dict):
         if resp.get("output"):
@@ -567,23 +602,6 @@ def call_assistant(endpoint: str, messages: list) -> dict:
     raise last_error
 
 
-@mlflow.trace(name="cited_document_excerpts", span_type="RETRIEVER")
-def cited_document_excerpts(query: str, refs: list) -> list:
-    """Excerpts of the documents the answer relies on, most related to the question and the answer.
-    Exposed as a RETRIEVER step so that retrieval judges can assess them and they are readable in the trace."""
-    real = resolve_refs(refs)
-    if not real:
-        return []
-    res = w.vector_search_indexes.query_index(
-        index_name=VS_INDEX, columns=VS_COLUMNS, query_text=query[:2000], query_type="HYBRID",
-        num_results=EXCERPTS_PER_CASE, filters_json=json.dumps({"REF": real}))
-    cols = [c.name for c in res.manifest.columns]
-    rows = [dict(zip(cols, r)) for r in ((res.result.data_array if res.result else None) or [])]
-    return [Document(id=f"{r.get('REF')}#{i}", page_content=str(r.get("chunk_text") or "")[:EXCERPT_MAX_CHARS],
-                     metadata={"doc_uri": r.get("REF"), "section": str(r.get("semantic_headers") or "")[:200]})
-            for i, r in enumerate(rows)]
-
-
 def make_predict_fn(endpoint: str):
     @mlflow.trace(name="qualibot_turn", span_type="AGENT")
     def predict_fn(messages):
@@ -593,7 +611,8 @@ def make_predict_fn(endpoint: str):
         try:
             raw = call_assistant(endpoint, messages)
         except Exception as e:
-            mlflow.update_current_trace(tags={**tags, "call_ok": "false", "error": str(e)[:500]})
+            mlflow.update_current_trace(tags={**tags, "call_ok": "false"})
+            record_answer_context({"error": str(e)[:1000], "returned_refs": [], "cited_refs": []})
             cited_document_excerpts(question, [])
             return ""
         raw_answer = _extract_text(raw) or ""
@@ -602,12 +621,11 @@ def make_predict_fn(endpoint: str):
         cited = sorted(code_like(raw_answer))
         docs = cited_document_excerpts(f"{question}\n{answer[:800]}", returned + cited)
         refs = classify_refs(cited, "\n".join(d.page_content for d in docs))
-        mlflow.update_current_trace(tags={
-            **tags, "call_ok": "true", "latency_s": f"{time.time() - t0:.2f}",
-            "returned_refs": json.dumps(returned, ensure_ascii=False), "cited_refs": json.dumps(cited, ensure_ascii=False),
-            "approximate_refs": json.dumps(refs["approximate"], ensure_ascii=False),
-            "unindexed_refs": json.dumps(refs["unindexed"], ensure_ascii=False),
-            "unverified_refs": json.dumps(refs["unverified"], ensure_ascii=False)})
+        # Short identifiers only in the tags; document lists go to the answer_context step
+        mlflow.update_current_trace(tags={**tags, "call_ok": "true", "latency_s": f"{time.time() - t0:.2f}"})
+        record_answer_context({"returned_refs": returned, "cited_refs": cited, "error": None,
+                               "excerpt_refs": sorted({d.metadata["doc_uri"] for d in docs}),
+                               **{f"{k}_refs": v for k, v in refs.items()}})
         return answer
     return predict_fn
 
@@ -667,7 +685,6 @@ def retrieval_sufficiency(expectations, trace):
 def document_recall(expectations, trace):
     """Share of the expected documents returned or cited by the assistant. Codes are compared with a key insensitive to
     language suffix, separators, case and zero padding (IN_APO_006 = IN_APO_0006, PRLAT549.FR = PRLAT549_GB)."""
-    import json
     import re
 
     from mlflow.entities import Feedback
@@ -681,8 +698,8 @@ def document_recall(expectations, trace):
     expected = [str(d["doc_uri"]) for d in (expectations or {}).get("expected_retrieved_context", [])]
     if not expected:
         return None
-    tags = trace.info.tags or {}
-    found = {key(r) for r in json.loads(tags.get("returned_refs", "[]")) + json.loads(tags.get("cited_refs", "[]"))}
+    context = next((s.outputs for s in trace.search_spans(name="answer_context") if isinstance(s.outputs, dict)), {})
+    found = {key(r) for r in (context.get("returned_refs") or []) + (context.get("cited_refs") or [])}
     hit = [r for r in expected if key(r) in found]
     return Feedback(value=round(len(hit) / len(expected), 3), rationale=f"expected: {expected} · found: {hit}")
 
@@ -693,8 +710,9 @@ def operations(outputs, trace):
     from mlflow.entities import Feedback
 
     tags = trace.info.tags or {}
+    context = next((s.outputs for s in trace.search_spans(name="answer_context") if isinstance(s.outputs, dict)), {})
     ok = tags.get("call_ok") == "true" or (tags.get("call_ok") is None and bool(str(outputs or "").strip()))
-    feedbacks = [Feedback(name="call_ok", value=ok, rationale=tags.get("error") or None)]
+    feedbacks = [Feedback(name="call_ok", value=ok, rationale=context.get("error") or None)]
     if tags.get("latency_s"):
         feedbacks.append(Feedback(name="latency_s", value=float(tags["latency_s"])))
     return feedbacks
@@ -734,7 +752,7 @@ if JUDGE_MODEL and not _judges_work(JUDGE_MODEL):
     JUDGE_MODEL = None
 LLM_JUDGES, TRACE_JUDGES, CODE_SCORERS = build_scorers(JUDGE_MODEL)
 SCORERS = LLM_JUDGES + TRACE_JUDGES + CODE_SCORERS
-SCORERS_CONFIG_ID = scorers_config_id(SCORERS, JUDGE_MODEL, EXCERPTS_PER_CASE)
+SCORERS_CONFIG_ID = scorers_config_id(SCORERS, JUDGE_MODEL, EXCERPTS_PER_DOCUMENT, MAX_DOCUMENTS_CHECKED)
 print(f"Judge model: {JUDGE_MODEL or 'Databricks-managed'} · {len(LLM_JUDGES) + len(TRACE_JUDGES)} LLM judges · "
       f"{len(CODE_SCORERS)} code scorers · configuration {SCORERS_CONFIG_ID}")
 publish_scorers(SCORERS, EXPERIMENT_ID, SCORERS_CONFIG_ID)
@@ -779,7 +797,8 @@ if RUN_EVAL:
                 mlflow.set_tags({"endpoint": endpoint, "subset": subset_label, "dataset": DATASET_NAME,
                                  "judge_model": JUDGE_MODEL or "databricks-managed",
                                  "scorers_config_id": SCORERS_CONFIG_ID})
-                mlflow.log_params({"n_cases": n, "repeat": rep, "excerpts_per_case": EXCERPTS_PER_CASE})
+                mlflow.log_params({"n_cases": n, "repeat": rep, "excerpts_per_document": EXCERPTS_PER_DOCUMENT,
+                                   "max_documents_checked": MAX_DOCUMENTS_CHECKED})
                 if subset_label != "full":
                     mlflow.log_input(eval_ds, context="evaluation")   # links a sampled run to the golden dataset too
                 mlflow.genai.evaluate(data=data, predict_fn=make_predict_fn(endpoint), scorers=SCORERS)
@@ -911,7 +930,7 @@ def run_traces(run_id: str) -> list:
                 answer = json.loads(answer)       # the trace output is stored JSON-encoded
             except json.JSONDecodeError:
                 pass
-        out.append({"trace_id": t.info.trace_id, "tags": t.info.tags or {}, "answer": answer,
+        out.append({"trace_id": t.info.trace_id, "tags": t.info.tags or {}, "context": answer_context(t), "answer": answer,
                     "assessments": [assessment_row(a) for a in (t.info.assessments or [])
                                     if type(a).__name__ != "Expectation" and getattr(a, "expectation", None) is None]})
     return out
@@ -922,7 +941,7 @@ def collect(run_id: str) -> pd.DataFrame:
     rows = []
     for tr in run_traces(run_id):
         row, why = {"trace_id": tr["trace_id"], "case_id": tr["tags"].get("case_id"), "answer": tr["answer"],
-                    "_tags": tr["tags"], "_assessments": tr["assessments"]}, {}
+                    "_tags": tr["tags"], "_context": tr["context"], "_assessments": tr["assessments"]}, {}
         for a in tr["assessments"]:
             value = None if a["error"] else numeric_value(a["name"], a["value"])
             if value is None:
@@ -986,15 +1005,15 @@ def write_run_tables(run_id: str, res: pd.DataFrame, summary: pd.DataFrame):
     result_rows, assessment_rows = [], []
     for _, r in res.iterrows():
         exp = r.get("expectations") if isinstance(r.get("expectations"), dict) else {}
-        t = r["_tags"]
+        ctx = r["_context"]
         result_rows.append({
             "run_id": run_id, "case_id": r["case_id"], "endpoint": endpoint, "question": r.get("question"),
             "intent": r.get("intent"), "difficulty": r.get("difficulty"),
             "final_answerability": r.get("final_answerability"), "expected": _expected_text(exp),
             "expected_sources": [clean_ref(d["doc_uri"]) for d in exp.get("expected_retrieved_context", [])],
             "answer": str(r.get("answer") or "")[:4000],
-            "returned_refs": json.loads(t.get("returned_refs", "[]")), "cited_refs": json.loads(t.get("cited_refs", "[]")),
-            "unverified_refs": json.loads(t.get("unverified_refs", "[]")), "trace_id": r["trace_id"],
+            "returned_refs": ctx.get("returned_refs") or [], "cited_refs": ctx.get("cited_refs") or [],
+            "unverified_refs": ctx.get("unverified_refs") or [], "trace_id": r["trace_id"],
             **{m: r.get(m) for m in METRICS}, "human_fact_coverage": r.get("human::fact_coverage"),
             "failed_scorers": [m for m in FAILURE_METRICS if r.get(m) == 0]})
         assessment_rows += [{"run_id": run_id, "case_id": r["case_id"], "endpoint": endpoint, "trace_id": r["trace_id"],
@@ -1066,7 +1085,8 @@ else:
         mlflow.log_metrics({f"report/{r.metric}": float(r.score) for r in summary.itertuples()})
         mlflow.log_table(summary, "report/summary.json")
         if len(failures):
-            mlflow.log_table(failures.drop(columns=["_why", "_tags", "_assessments", "expectations"], errors="ignore")
+            mlflow.log_table(failures.drop(columns=["_why", "_tags", "_context", "_assessments", "expectations"],
+                                           errors="ignore")
                              .astype(str), "report/failures.json")
     print("✓ report logged to the run (Metrics: report/*, Artifacts: report/)")
     write_run_tables(run_id, res, summary)
@@ -1232,8 +1252,8 @@ if rid:
         if exp.get("guidelines"):
             out += ["", "**Guidelines**:"] + [f"- {g}" for g in exp["guidelines"]]
         out += ["", f"**Expected documents**: {', '.join(clean_ref(d['doc_uri']) for d in exp.get('expected_retrieved_context', [])) or '—'}",
-                f"**Documents returned by the assistant**: {', '.join(json.loads(tags.get('returned_refs', '[]'))) or '—'}",
-                f"**Documents cited in the answer**: {', '.join(json.loads(tags.get('cited_refs', '[]'))) or '—'}",
+                f"**Documents returned by the assistant**: {', '.join(r['_context'].get('returned_refs') or []) or '—'}",
+                f"**Documents cited in the answer**: {', '.join(r['_context'].get('cited_refs') or []) or '—'}",
                 "", "**Assistant answer**:", "", "> " + answer[:MAX_ANSWER_CHARS].replace("\n", "\n> ")
                 + (f"\n> […] ({len(answer)} characters)" if len(answer) > MAX_ANSWER_CHARS else ""), "", "**Scores**:"]
         for m in METRICS:

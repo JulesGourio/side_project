@@ -41,7 +41,8 @@ pdf = pd.DataFrame([
          trace_id="tr-2", answer="APO: voir **IN_APO_006** et **ZZ-9999**. INVENTED claim.",
          sources_json=json.dumps([{"rank": 0, "title": "IN_APO_0006", "url": "https://x/l?id=abc", "n": 1}]),
          prior_messages=[{"role": "user", "content": "Durée ?"}, {"role": "assistant", "content": "10 ans"}, {"role": "user", "content": "que veut dire APO ?"}],
-         next_user_message="c'est faux", feedback_vote="up", feedback_comment=None),
+         next_user_message="c'est faux. " + "La réponse ne cite pas la bonne exigence du client Dassault. " * 8,
+         feedback_vote="up", feedback_comment=None),
     dict(message_id=3, created_at=pd.Timestamp("2026-09-21"), session_id="s2", division="AS", endpoint_name="ka-3a7e9255-endpoint",
          trace_id=None, answer="Hors périmètre : je réponds uniquement sur la documentation qualité.", sources_json=None,
          prior_messages=[{"role": "user", "content": "fais ma liste de courses"}], next_user_message=None,
@@ -111,6 +112,9 @@ if not DRY:
     tr = mlflow.search_traces(experiment_ids=[ns["EXPERIMENT_ID"]], run_id=ns["MLFLOW_RUN_ID"], return_type="list")
     t = [x for x in tr if x.info.tags.get("message_id") == "2"][0]
     print("spans:", [s.name for s in t.data.spans], "| session:", t.info.trace_metadata.get("mlflow.trace.session"))
+    long_tags = {k: len(v) for k, v in (t.info.tags or {}).items() if not k.startswith("mlflow.") and len(v) > 250}
+    assert not long_tags, f"trace tags longer than 250 characters: {long_tags}"
+    print("trace tags all within 250 characters: ok")
     print("assessments:", sorted((a.name, str(a.value)) for a in t.info.assessments))
     from mlflow.genai.scorers import list_scorers
     print("registered:", sorted(s.name for s in list_scorers(experiment_id=ns["EXPERIMENT_ID"])))

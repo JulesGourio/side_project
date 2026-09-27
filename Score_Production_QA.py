@@ -123,7 +123,8 @@ MAX_PARALLEL_TURNS = 4                 # turns scored in parallel (each turn run
 VS_INDEX = "uat_landingzone.qualibot.chunks_index_v1"   # index holding ALL chunks (the ALL assistant's index)
 VS_COLUMNS = ["REF", "chunk_text", "semantic_headers"]
 REF_SOURCE_TABLE = None                # source table of the index; None = read from the index definition
-EXCERPTS_PER_TURN = 10
+EXCERPTS_PER_DOCUMENT = 3             # excerpts per cited document
+MAX_DOCUMENTS_CHECKED = 6              # cited documents checked per turn
 EXCERPT_MAX_CHARS = 1500
 
 # ── Cost estimate (pay-per-token, DBU per 1M tokens) ──
@@ -176,6 +177,7 @@ from typing import Literal
 
 import mlflow
 from mlflow import MlflowClient
+from mlflow.entities import Document
 from mlflow.genai.judges import make_judge
 from mlflow.genai.scorers import delete_scorer, scorer
 from pyspark.sql.types import ArrayType, BooleanType, DoubleType, LongType, StringType
@@ -207,7 +209,8 @@ SHARED_JUDGES = {
 Does the answer address what the user asked, given the whole conversation? When the last user message asks to modify,
 correct or restate the previous answer ("remove document X", "shorter", "same for Y"), judge whether the answer applies
 that request. An appropriate refusal of an out-of-scope request, or a justified "not found", counts as relevant.
-Return yes or no."""),
+Judge only whether the content addresses the request: the language of the answer, the correctness of its facts and the
+strength of its evidence are judged separately and must not lower this verdict. Return yes or no."""),
     "language_match": (
         "The answer is written in the language of the user's last message.",
         CONTEXT + """
@@ -289,23 +292,58 @@ was missed, if anything.""",
 def reference_integrity(trace):
     """True when every cited document code exists: resolved typos (zero padding) and documents outside the corpus
     mentioned in the excerpts are accepted; codes found nowhere are reported as unverified."""
-    import json
-
     from mlflow.entities import Feedback
 
-    tags = trace.info.tags or {}
-    unverified = json.loads(tags.get("unverified_refs", "[]"))
+    context = next((s.outputs for s in trace.search_spans(name="answer_context") if isinstance(s.outputs, dict)), {})
+    unverified = context.get("unverified_refs") or []
     notes = []
-    if json.loads(tags.get("approximate_refs", "[]")):
-        notes.append(f"resolved: {json.loads(tags['approximate_refs'])}")
-    if json.loads(tags.get("unindexed_refs", "[]")):
-        notes.append(f"outside the corpus: {json.loads(tags['unindexed_refs'])}")
+    if context.get("approximate_refs"):
+        notes.append(f"resolved: {context['approximate_refs']}")
+    if context.get("unindexed_refs"):
+        notes.append(f"outside the corpus: {context['unindexed_refs']}")
     if unverified:
         notes.append(f"unverified: {unverified}")
     return Feedback(value=not unverified, rationale="; ".join(notes) or "all cited codes exist")
 
 
 SHARED_TRACE_SCORERS = [groundedness, missed_answer, reference_integrity]
+
+
+# ── Trace steps read by the scorers ──
+def record_answer_context(context: dict):
+    """Variable-length data of a turn or case (document lists, next user message, errors), stored as the trace step
+    answer_context: trace tags are limited in length and a tag that is too long makes the whole trace fail."""
+    with mlflow.start_span(name="answer_context", span_type="UNKNOWN") as span:
+        span.set_outputs(context)
+
+
+def answer_context(trace) -> dict:
+    return next((s.outputs for s in trace.search_spans(name="answer_context") if isinstance(s.outputs, dict)), {})
+
+
+@mlflow.trace(name="cited_document_excerpts", span_type="RETRIEVER")
+def cited_document_excerpts(query: str, cited_documents: list) -> list:
+    """Excerpts of the cited documents most related to the question and the answer: up to EXCERPTS_PER_DOCUMENT
+    excerpts for each of the first MAX_DOCUMENTS_CHECKED cited documents (Vector Search, filtered on each document and
+    its language variants), so that every checked document is represented. Shown as a RETRIEVER step so that the
+    retrieval judges can use them and they are readable in the trace."""
+    documents = {}
+    for ref in cited_documents:
+        key = base_ref(ref)
+        if len(key) >= 4 and key in REFS_BY_BASE:
+            documents.setdefault(key, sorted(REFS_BY_BASE[key]))
+    excerpts = []
+    for variants in list(documents.values())[:MAX_DOCUMENTS_CHECKED]:
+        res = w.vector_search_indexes.query_index(
+            index_name=VS_INDEX, columns=VS_COLUMNS, query_text=query[:2000], query_type="HYBRID",
+            num_results=EXCERPTS_PER_DOCUMENT, filters_json=json.dumps({"REF": variants}))
+        cols = [c.name for c in res.manifest.columns]
+        rows = [dict(zip(cols, r)) for r in ((res.result.data_array if res.result else None) or [])]
+        excerpts += [Document(id=f"{r.get('REF')}#{len(excerpts) + i}",
+                              page_content=str(r.get("chunk_text") or "")[:EXCERPT_MAX_CHARS],
+                              metadata={"doc_uri": r.get("REF"), "section": str(r.get("semantic_headers") or "")[:200]})
+                     for i, r in enumerate(rows)]
+    return excerpts
 
 # ── Numeric form of a verdict: 1 = pass, 0 = fail, 0.5 = partial; counts and durations as is; NULL for labels ──
 SCORE_VALUES = {"yes": 1.0, "no": 0.0, "true": 1.0, "false": 0.0, "full": 1.0, "partial": 0.5, "none": 0.0,
@@ -540,21 +578,24 @@ Classify the answer:
 - out_of_scope_refusal: declines an off-topic request;
 - clarification_request: asks the user to clarify instead of answering;
 - error_or_empty: technical error message, or empty or truncated answer. An answer that addresses another question
-  is still classified by what it does (answered_full, answered_partial…): relevance is judged separately."""),
+  is still classified by what it does (answered_full, answered_partial…): relevance is judged separately.
+Classify by how much of the question the answer covers, not by the correctness of its facts or the strength of its
+evidence, which are judged separately."""),
 }
 
 
 @scorer(name="user_reaction", description="Implicit feedback carried by the user's next message: no_next_turn, moves_on, "
                                           "follow_up, rephrase_same_question, correction_or_complaint.")
 def user_reaction(inputs, outputs, trace):
-    """Classifies the user's next message (trace tag next_user_message, kept out of the inputs so that the other judges
-    only see the conversation up to the question). Free (no judge call) when the user wrote nothing after the answer."""
+    """Classifies the user's next message (answer_context step of the trace, kept out of the inputs so that the other
+    judges only see the conversation up to the question). Free (no judge call) when the user wrote nothing after it."""
     from typing import Literal
 
     from mlflow.entities import Feedback
     from mlflow.genai.judges import make_judge
 
-    next_message = (trace.info.tags or {}).get("next_user_message")
+    context = next((s.outputs for s in trace.search_spans(name="answer_context") if isinstance(s.outputs, dict)), {})
+    next_message = context.get("next_user_message")
     if not next_message:
         return Feedback(value="no_next_turn", rationale="The user wrote nothing after this answer.")
     question = next((m["content"] for m in reversed(inputs["messages"]) if m["role"] == "user"), "")
@@ -573,9 +614,8 @@ unhelpful). Write the rationale in English, in one sentence.""",
 @scorer(name="citation_count", description="Number of documents the assistant listed as sources.")
 def citation_count(trace):
     """Number of documents the assistant listed as sources."""
-    import json
-
-    return len(json.loads((trace.info.tags or {}).get("source_refs", "[]")))
+    context = next((s.outputs for s in trace.search_spans(name="answer_context") if isinstance(s.outputs, dict)), {})
+    return len(context.get("source_refs") or [])
 
 
 @scorer(name="safety", description="No harmful, offensive or leaked content (built-in judge), on a stable 10% sample "
@@ -612,7 +652,10 @@ def turn_verdict(v: dict) -> tuple:
     if at == "out_of_scope_refusal" and intent not in ("out_of_scope", "chitchat_or_meta"):
         bad.append("wrongful_refusal")
     if v.get("missed_answer") == "yes":
-        bad.append("missed_answer_in_sources")
+        if at in ("not_found", "out_of_scope_refusal", "clarification_request"):
+            bad.append("missed_answer_in_sources")        # "not found" although the cited documents contain it
+        else:
+            warn.append("missed_information")             # answered, but left out details the documents contain
     if v.get("groundedness") == "not_supported":
         bad.append("unsupported_claims")
     elif v.get("groundedness") == "partially_supported":
@@ -659,7 +702,7 @@ SCORERS = LLM_JUDGES + TRACE_JUDGES + CODE_SCORERS
 
 # Fingerprint of everything that determines a score: scorers, judge model, verdict rules, excerpts, history window
 JUDGE_CONFIG_ID = scorers_config_id(SCORERS, JUDGE_MODEL, inspect.getsource(turn_verdict),
-                                    EXCERPTS_PER_TURN, CHAT_HISTORY_LIMIT)
+                                    EXCERPTS_PER_DOCUMENT, MAX_DOCUMENTS_CHECKED, CHAT_HISTORY_LIMIT)
 print(f"Judge model: {JUDGE_MODEL or 'Databricks-managed'} · {len(SCORERS)} scorers · judge_config_id={JUDGE_CONFIG_ID}")
 if not DRY_RUN:
     publish_scorers(SCORERS, EXPERIMENT_ID, JUDGE_CONFIG_ID)
@@ -744,8 +787,6 @@ print(f"{len(pdf_pairs)} assistant turn(s) to score (cap {cap}).")
 # COMMAND ----------
 
 # DBTITLE 1,Replayed turns — evaluation records and the traced replay (answer + cited document excerpts)
-from mlflow.entities import Document
-
 
 def to_messages(prior) -> list:
     """COLLECT_LIST(STRUCT(...)) comes back as dicts or Rows depending on the Spark Connect path."""
@@ -802,45 +843,30 @@ RECORDS = [{"inputs": {"messages": t["thread"], "message_id": mid}}
            for mid, t in TURNS.items()]
 
 
-@mlflow.trace(name="cited_document_excerpts", span_type="RETRIEVER")
-def cited_document_excerpts(query: str, cited_documents: list) -> list:
-    """Excerpts of the cited documents most related to the question and the answer (Vector Search, filtered on the
-    documents). Shown as a RETRIEVER step so that the retrieval judges can use them and they are readable in the trace."""
-    real = resolve_refs(cited_documents)
-    if not real:
-        return []
-    res = w.vector_search_indexes.query_index(
-        index_name=VS_INDEX, columns=VS_COLUMNS, query_text=query[:2000], query_type="HYBRID",
-        num_results=EXCERPTS_PER_TURN, filters_json=json.dumps({"REF": real}))
-    cols = [c.name for c in res.manifest.columns]
-    rows = [dict(zip(cols, r)) for r in ((res.result.data_array if res.result else None) or [])]
-    return [Document(id=f"{r.get('REF')}#{i}", page_content=str(r.get("chunk_text") or "")[:EXCERPT_MAX_CHARS],
-                     metadata={"doc_uri": r.get("REF"), "section": str(r.get("semantic_headers") or "")[:200]})
-            for i, r in enumerate(rows)]
-
-
 @mlflow.trace(name="qualibot_turn", span_type="AGENT")
 def replay_turn(messages, message_id):
     """Returns the answer stored in chat_messages; the trace carries the turn's identifiers and cited documents."""
     t = TURNS[message_id]
     row = t["row"]
-    tags = {"message_id": message_id, "endpoint": str(row["endpoint_name"]), "division": str(row["division"]),
-            "agent_trace_id": _text(row.get("trace_id")) or "", "judge_model": JUDGE_MODEL or "",
-            "judge_config_id": JUDGE_CONFIG_ID, "source_refs": json.dumps(t["source_refs"], ensure_ascii=False),
-            "cited_refs": json.dumps(t["cited_refs"], ensure_ascii=False),
-            "safety_sample": str(in_sample(message_id, SAFETY_SAMPLE_RATE, "safety")).lower(),
-            "next_user_message": t["next_user_message"] or ""}
+    # Short identifiers only in the tags; document lists and the next user message go to the answer_context step
+    mlflow.update_current_trace(
+        tags={"message_id": message_id, "endpoint": str(row["endpoint_name"]), "division": str(row["division"]),
+              "agent_trace_id": _text(row.get("trace_id")) or "", "judge_model": JUDGE_MODEL or "",
+              "judge_config_id": JUDGE_CONFIG_ID,
+              "safety_sample": str(in_sample(message_id, SAFETY_SAMPLE_RATE, "safety")).lower()},
+        metadata={"mlflow.trace.session": str(row["session_id"])})
+    context = {"source_refs": t["source_refs"], "cited_refs": t["cited_refs"],
+               "next_user_message": t["next_user_message"], "retrieval_error": None}
     docs = []
     refs = list(dict.fromkeys(t["source_refs"] + t["cited_refs"]))
     if refs and REFS_BY_BASE:
         try:
             docs = cited_document_excerpts(f"{t['question']}\n{t['answer'][:800]}", refs)
         except Exception as e:
-            tags["retrieval_error"] = str(e)[:300]
+            context["retrieval_error"] = str(e)[:500]
     classes = classify_refs(t["cited_refs"], "\n".join(d.page_content for d in docs))
-    tags.update({"excerpt_refs": json.dumps(sorted({d.metadata["doc_uri"] for d in docs}), ensure_ascii=False),
-                 **{f"{k}_refs": json.dumps(v, ensure_ascii=False) for k, v in classes.items()}})
-    mlflow.update_current_trace(tags=tags, metadata={"mlflow.trace.session": str(row["session_id"])})
+    record_answer_context({**context, "excerpt_refs": sorted({d.metadata["doc_uri"] for d in docs}),
+                           **{f"{k}_refs": v for k, v in classes.items()}})
     return t["answer"]
 
 # COMMAND ----------
@@ -862,7 +888,9 @@ def estimated_usage(t: dict) -> tuple:
     retrieval = 2 if (t["source_refs"] or t["cited_refs"]) and REFS_BY_BASE else 0
     reaction = 1 if t["next_user_message"] else 0
     calls = len(LLM_JUDGES) + retrieval + reaction + SAFETY_SAMPLE_RATE
-    tokens_in = (len(LLM_JUDGES) * prompt_chars + retrieval * (EXCERPTS_PER_TURN * EXCERPT_MAX_CHARS + len(t["answer"]))
+    n_docs = min(len({base_ref(r) for r in t["source_refs"] + t["cited_refs"]}), MAX_DOCUMENTS_CHECKED)
+    tokens_in = (len(LLM_JUDGES) * prompt_chars
+                 + retrieval * (n_docs * EXCERPTS_PER_DOCUMENT * EXCERPT_MAX_CHARS + len(t["answer"]))
                  + reaction * 3000) / CHARS_PER_TOKEN
     return calls, tokens_in, calls * OUTPUT_TOKENS_PER_JUDGE_CALL
 
@@ -884,15 +912,16 @@ else:
         MLFLOW_RUN_ID = run.info.run_id
         mlflow.set_tags({"judge_model": JUDGE_MODEL or "databricks-managed", "judge_config_id": JUDGE_CONFIG_ID,
                          "source_table": SOURCE_TABLE})
-        mlflow.log_params({"n_turns": len(TURNS), "test_limit": TEST_LIMIT, "excerpts_per_turn": EXCERPTS_PER_TURN})
+        mlflow.log_params({"n_turns": len(TURNS), "test_limit": TEST_LIMIT, "excerpts_per_document": EXCERPTS_PER_DOCUMENT,
+                           "max_documents_checked": MAX_DOCUMENTS_CHECKED})
         mlflow.genai.evaluate(data=RECORDS, predict_fn=replay_turn, scorers=SCORERS)
 
     # Scores are read back from the traces (tags and assessments only)
     for tr in mlflow.search_traces(locations=[EXPERIMENT_ID], run_id=MLFLOW_RUN_ID, return_type="list",
-                                   include_spans=False, max_results=len(TURNS) + 100):
+                                   max_results=len(TURNS) + 100):
         tags = tr.info.tags or {}
         if tags.get("message_id") in TURNS:
-            results[tags["message_id"]] = {"trace_id": tr.info.trace_id, "tags": tags,
+            results[tags["message_id"]] = {"trace_id": tr.info.trace_id, "tags": tags, "context": answer_context(tr),
                                            "assessments": [assessment_row(a) for a in (tr.info.assessments or [])]}
     print(f"{len(results)}/{len(TURNS)} turns scored in {time.time() - t_start:.0f} s · run {MLFLOW_RUN_ID}")
 
@@ -916,16 +945,16 @@ def _yes(v):
 
 def build_record(mid: str) -> dict:
     t = TURNS[mid]
-    res = results.get(mid, {"trace_id": None, "tags": {}, "assessments": []})
-    row, tags = t["row"], res["tags"]
+    res = results.get(mid, {"trace_id": None, "tags": {}, "context": {}, "assessments": []})
+    row, context = t["row"], res["context"]
     ok_rows = [a for a in res["assessments"] if not a["error"] and a["value"] is not None]
     v = {a["name"]: a["value"] for a in ok_rows}
     why = {a["name"]: a["rationale"] for a in ok_rows}
     errors = [f"{a['name']}: {a['error'][:200]}" for a in res["assessments"] if a["error"]]
     if not res["trace_id"]:
         errors.append("turn not scored")
-    if tags.get("retrieval_error"):
-        errors.append(f"vector_search: {tags['retrieval_error']}")
+    if context.get("retrieval_error"):
+        errors.append(f"vector_search: {context['retrieval_error']}")
     verdict, reasons = turn_verdict(v) if REQUIRED <= set(v) else (None, ["judge_failed"])
     vote = _text(row.get("feedback_vote"))
     disagreement = (verdict == "good" and vote == "down") or (verdict == "bad" and vote == "up")
@@ -939,10 +968,10 @@ def build_record(mid: str) -> dict:
         "user_question": t["question"], "thread_turn_count": len(t["thread"]), "answer": t["answer"][:4000],
         "next_user_message": t["next_user_message"],
         "citation_count": len(t["source_refs"]), "source_refs": t["source_refs"], "cited_refs": t["cited_refs"],
-        "excerpt_refs": json.loads(tags.get("excerpt_refs", "[]")),
-        "approximate_refs": json.loads(tags.get("approximate_refs", "[]")),
-        "unindexed_refs": json.loads(tags.get("unindexed_refs", "[]")),
-        "unverified_refs": json.loads(tags.get("unverified_refs", "[]")),
+        "excerpt_refs": context.get("excerpt_refs") or [],
+        "approximate_refs": context.get("approximate_refs") or [],
+        "unindexed_refs": context.get("unindexed_refs") or [],
+        "unverified_refs": context.get("unverified_refs") or [],
         "feedback_vote": vote, "feedback_comment": _text(row.get("feedback_comment")),
         "question_intent": v.get("question_intent"),
         "in_scope": None if not v.get("question_intent") else

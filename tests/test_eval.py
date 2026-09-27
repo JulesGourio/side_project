@@ -77,6 +77,10 @@ run = mlflow.get_run(ns["RUN_IDS"][-1])
 print("dataset inputs:", [d.dataset.name for d in run.inputs.dataset_inputs])
 print("judge models used:", sorted({c[1] for c in calls}))
 print("tables:", {t: len(r) for t, r in sql.tables.items()}, "| views:", sorted(sql.views))
+for tr in mlflow.search_traces(locations=[ns["EXPERIMENT_ID"]], run_id=ns["RUN_IDS"][-1], return_type="list"):
+    long_tags = {k: len(v) for k, v in (tr.info.tags or {}).items() if not k.startswith("mlflow.") and len(v) > 250}
+    assert not long_tags, f"trace tags longer than 250 characters: {long_tags}"
+print("trace tags all within 250 characters: ok")
 print(pd.DataFrame(sql.tables["uat_proj.qualibot.ka_eval_metrics"])[["metric", "score", "ci_low", "ci_high", "n"]].to_string())
 r = pd.DataFrame(sql.tables["uat_proj.qualibot.ka_eval_results"])
 print(r[["case_id", "question", "correctness", "groundedness", "reference_integrity", "failed_scorers", "expected_sources"]].to_string())
