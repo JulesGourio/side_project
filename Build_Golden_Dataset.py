@@ -20,7 +20,7 @@
 # MAGIC | 9 | Verify every fact independently | 1 per case |
 # MAGIC | 10 | Consolidate and select a balanced final set of 20 to 30 cases, compliance-matrix questions included | – |
 # MAGIC | 11 | Human review (validate / reject / expert) | – |
-# MAGIC | 12 | Export to the MLflow evaluation dataset (Unity Catalog), linked to the evaluation experiment | – |
+# MAGIC | 12 | Export to the MLflow evaluation dataset (Unity Catalog), linked to the evaluation experiment, and to the flat table `ka_eval_golden_cases` (composition and review status, for the dashboard) | – |
 # MAGIC | 13 | Cost: estimate vs actual | – |
 # MAGIC
 # MAGIC **Persistence and restart.** Every step is cached in a single Delta table (`CACHE_TABLE`, one row per
@@ -86,6 +86,7 @@ SRC = "uat_landingzone.qualibot"                       # chat_messages, chat_fee
 CACHE_TABLE = f"{SRC}.qualibot_eval_cache"             # cache of every step
 EVAL_DATASET_UC = f"{SRC}.qualibot_eval_golden"        # MLflow evaluation dataset
 PROD_SCORES_TABLE = "uat_proj.qualibot.chat_quality_scores"   # production scoring (source of failure cases)
+GOLDEN_CASES_TABLE = "uat_proj.qualibot.ka_eval_golden_cases"  # flat view of the reviewed cases, for the dashboard
 VS_ENDPOINT = "qualibot"
 VS_INDEX = f"{SRC}.chunks_index_v1"
 VS_COLUMNS = ["REF", "chunk_text", "semantic_headers"]
@@ -1690,6 +1691,56 @@ if records:
     eval_ds.merge_records(records)
 print(f"✓ {EVAL_DATASET_UC}: {len(eval_ds.to_df())} cases, linked to {EVAL_EXPERIMENT} (Datasets tab)")
 display(eval_ds.to_df())
+
+# Flat table of every reviewed case (exported or not): dataset composition and review progress for the dashboard.
+# case_id matches ka_eval_results.case_id.
+GOLDEN_CASES_COLUMNS = [
+    ("case_id", T.StringType(), "Case id (question id of the builder; negative for synthetic questions)"),
+    ("exported", T.BooleanType(), "The case is in the MLflow evaluation dataset"),
+    ("exclusion_reason", T.StringType(), "Why a case is not exported: review status or correction note"),
+    ("review_status", T.StringType(), "to_review, validated, rejected or expert (human review, section 11)"),
+    ("review_note", T.StringType(), "Note of the human reviewer"),
+    ("source", T.StringType(), "log (production conversation), override (curated log case) or synthetic"),
+    ("slot", T.StringType(), "Selection slot of the shortlist (production_failure, requirement_compliance, …)"),
+    ("intent", T.StringType(), "Question type"),
+    ("difficulty", T.StringType(), "easy, medium or hard"),
+    ("language", T.StringType(), "fr, en or other"),
+    ("question", T.StringType(), "Question as asked"),
+    ("final_answerability", T.StringType(), "full, partial, none or out_of_scope: whether the documentation answers it"),
+    ("expected", T.StringType(), "Expected facts (one per line), or the expected answer for refusal cases"),
+    ("n_expected_facts", T.LongType(), "Number of expected facts"),
+    ("expected_sources", T.ArrayType(T.StringType()), "Documents the answer should rely on"),
+    ("guidelines", T.ArrayType(T.StringType()), "Behavioural guidelines checked by the judges"),
+    ("ka_verdict", T.StringType(), "Assistant verdict when the case was built (correct, incorrect, …)"),
+    ("confidence_final", T.LongType(), "Confidence in the reference answer, 0 to 3"),
+    ("dataset_name", T.StringType(), "MLflow evaluation dataset"),
+    ("exported_at", T.StringType(), "Export time (UTC)"),
+]
+GOLDEN_CASES_SCHEMA = T.StructType([T.StructField(n, t) for n, t, _ in GOLDEN_CASES_COLUMNS])
+exported_ids = set(kept["question_id"])
+reject_notes = dict(rejected)
+exported_at = pd.Timestamp.now(tz="UTC").isoformat(timespec="seconds")
+case_rows = []
+for _, r in pdf_final.iterrows():
+    qid = int(r.question_id)
+    rec = to_record(r)["expectations"] if qid in exported_ids else {}
+    facts = rec.get("expected_facts", [f["fact"] for f in r.essential_facts])
+    case_rows.append((
+        str(qid), qid in exported_ids,
+        None if qid in exported_ids else reject_notes.get(qid, f"review status: {status(qid)}"),
+        status(qid), decisions.get(qid, ("", ""))[1] or None, r.source, r.slot, r.intent, r.difficulty, r.language,
+        r.question, r.final_answerability, "\n".join(facts) or rec.get("expected_response", r.expected_response),
+        len(facts), [clean_ref(d["doc_uri"]) for d in rec.get("expected_retrieved_context", [])] or list(r.expected_sources),
+        list(rec.get("guidelines", r.guidelines)), r.ka_verdict, int(r.confidence_final), EVAL_DATASET_UC, exported_at))
+esc = lambda t: str(t).replace("'", "\\'")
+if not spark.catalog.tableExists(GOLDEN_CASES_TABLE):
+    spark.sql(f"CREATE TABLE {GOLDEN_CASES_TABLE} (" + ", ".join(
+        f"`{n}` {t.simpleString().upper()} COMMENT '{esc(d)}'" for n, t, d in GOLDEN_CASES_COLUMNS)
+        + ") COMMENT 'Qualibot golden evaluation cases, one row per reviewed case: composition and review status of the "
+          "golden dataset.'")
+spark.createDataFrame(case_rows, GOLDEN_CASES_SCHEMA).createOrReplaceTempView("_golden_cases")
+spark.sql(f"INSERT OVERWRITE {GOLDEN_CASES_TABLE} SELECT * FROM _golden_cases")
+print(f"✓ {GOLDEN_CASES_TABLE}: {len(case_rows)} reviewed cases, {len(exported_ids)} exported")
 
 # COMMAND ----------
 

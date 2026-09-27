@@ -3,41 +3,44 @@
 # MAGIC %md
 # MAGIC # Qualibot — Production Answer Quality Monitoring
 # MAGIC
-# MAGIC Scores every assistant turn answered by the Qualibot Knowledge Assistants with MLflow judges and scorers.
+# MAGIC Scores every new assistant turn of the Qualibot Knowledge Assistants with MLflow judges and scorers, twice a day.
 # MAGIC The notebook never calls the assistants: it replays the answers already stored in `chat_messages`.
 # MAGIC
-# MAGIC ### What appears in the MLflow experiment
-# MAGIC | Tab | Content |
-# MAGIC |---|---|
-# MAGIC | **Runs** | one run per scoring run: verdict rates, failure reasons, bad rate per assistant, worst turns; the scored turns are the run's input dataset |
-# MAGIC | **Traces** | one trace per scored turn — inputs = the conversation as the assistant saw it, output = the stored answer, a `RETRIEVER` step with the excerpts of the cited documents — with every verdict and its rationale, the rule-based `turn_verdict` and the user's vote; turns of a conversation are grouped in **Sessions** |
-# MAGIC | **Judges / Scorers** | every scorer below, registered in the experiment (not scheduled: no background cost) |
-# MAGIC
 # MAGIC ### Scorers
-# MAGIC | Scorer | Type | Values |
-# MAGIC |---|---|---|
-# MAGIC | `question_intent`, `question_topic` | LLM judge | what the user asks (drives the dashboard breakdowns) |
-# MAGIC | `answer_type` | LLM judge | answered, partial_answer, not_found, out_of_scope_refusal, clarification_request, error_or_empty |
-# MAGIC | `relevance` | LLM judge | yes / no — follow-up requests ("shorter", "remove document X") are judged against the previous turn |
-# MAGIC | `completeness` | LLM judge | full / partial / none / not_applicable |
-# MAGIC | `language_match` | LLM judge | yes / no |
-# MAGIC | `user_reaction` | LLM judge | implicit feedback carried by the user's next message |
-# MAGIC | `safety` | built-in LLM judge | yes / no |
-# MAGIC | `groundedness` | LLM judge on the `RETRIEVER` step | supported / partially_supported / not_supported — excerpts are a subset of the documents: absence of evidence is not contradiction |
-# MAGIC | `missed_answer` | LLM judge on the `RETRIEVER` step | yes when the answer says "not found" (or leaves a part unanswered) while the excerpts contain it |
-# MAGIC | `reference_integrity`, `citation_count` | code | every cited code exists; number of documents listed as sources |
+# MAGIC | Scorer | Type | Values | When |
+# MAGIC |---|---|---|---|
+# MAGIC | `question_intent`, `question_topic` | LLM judge | what the user asks (dashboard breakdowns) | every turn |
+# MAGIC | `answer_type` | LLM judge | answered, partial_answer, not_found, out_of_scope_refusal, clarification_request, error_or_empty | every turn |
+# MAGIC | `relevance` ¹ | LLM judge | yes / no — follow-up requests ("shorter", "remove document X") are judged against the previous turn | every turn |
+# MAGIC | `completeness` | LLM judge | full / partial / none / not_applicable | every turn |
+# MAGIC | `language_match` ¹ | LLM judge | yes / no | every turn |
+# MAGIC | `safety` | built-in LLM judge | yes / no | every turn |
+# MAGIC | `user_reaction` | LLM judge | implicit feedback carried by the user's next message | when the user wrote again (otherwise `no_next_turn`, free) |
+# MAGIC | `groundedness` ¹ | LLM judge on the `RETRIEVER` step | supported / partially_supported / not_supported — the excerpts are a subset of the documents: absence of evidence is not contradiction | when the answer cites indexed documents |
+# MAGIC | `missed_answer` ¹ | LLM judge on the `RETRIEVER` step | yes when the answer says "not found" (or leaves a part unanswered) while the excerpts contain it | when the answer cites indexed documents |
+# MAGIC | `reference_integrity` ¹, `citation_count` | code | every cited code exists; number of documents listed as sources | every turn |
 # MAGIC
+# MAGIC ¹ identical in the evaluation notebook, so that production and golden-dataset results can be compared.
 # MAGIC The rule-based **turn verdict** (`good` / `acceptable` / `bad`, with actionable `failure_reasons`) combines them.
+# MAGIC Judges read the answers without the text fragments of citation links (`#:~:text=…`), which are longer than the
+# MAGIC cited passages themselves.
 # MAGIC
-# MAGIC ### Outputs (Unity Catalog)
-# MAGIC - `chat_quality_scores`: one row per assistant turn, merged on `message_id`. Turns whose scoring failed are retried on the next run.
-# MAGIC - `chat_quality_scoring_runs`: one row per run (volumes, rates, estimated cost, judge/user agreement).
+# MAGIC ### Outputs
+# MAGIC | Where | Content |
+# MAGIC |---|---|
+# MAGIC | `chat_quality_scores` | one row per assistant turn: labels, verdicts, rationales, references, cost — replaced when a turn is re-scored |
+# MAGIC | `chat_quality_assessments` | one row per turn × scorer (value, numeric value, rationale, error): any scorer can be charted without schema change |
+# MAGIC | `chat_quality_scoring_runs` | one row per run: volumes, rates, estimated cost, judge/user agreement |
+# MAGIC | `v_chat_quality_daily`, `v_chat_quality_scorers_daily`, `v_chat_quality_failure_reasons`, `v_chat_quality_review_queue` | dashboard-ready views |
+# MAGIC | MLflow experiment | **Runs**: one per scoring run (rates, failure reasons, worst turns) · **Traces**: one per turn (conversation, answer, cited excerpts, every verdict, user vote), grouped by conversation in **Sessions** · **Judges / Scorers**: every scorer above, registered but not scheduled |
+# MAGIC
+# MAGIC Every table and column carries a Unity Catalog comment.
 # MAGIC
 # MAGIC ### Operations
 # MAGIC - `dry_run=true` estimates the number of judge calls and the cost, and writes nothing.
-# MAGIC - `test_limit` caps the number of turns of an ad-hoc run; `reset_outputs=true` drops both output tables first.
-# MAGIC - `judge_config_id` fingerprints the judges, the model and the rules; `rescore_changed_config=true` re-scores the turns
-# MAGIC   judged with another configuration.
+# MAGIC - `test_limit` caps the number of turns of an ad-hoc run; `reset_outputs=true` drops the output tables first.
+# MAGIC - `judge_config_id` fingerprints the scorers, the judge model and the verdict rules; `rescore_changed_config=true`
+# MAGIC   re-scores the turns judged with another configuration.
 # MAGIC - `feedback_to_agent_traces=true` also attaches the verdict to the assistant's own trace (needs CAN_EDIT on the
 # MAGIC   assistants' experiments).
 # MAGIC - Alerts compare each assistant's daily bad-answer rate with its 7-day baseline and can fail the job to trigger its notifications.
@@ -83,10 +86,10 @@ print({p: _installed(p) for p in NEEDED})
 dbutils.widgets.text("test_limit", "")                                            # e.g. "20"; empty = no cap
 dbutils.widgets.dropdown("dry_run", "false", ["true", "false"])                   # true = estimate only, nothing written
 dbutils.widgets.dropdown("rescore_changed_config", "false", ["true", "false"])    # true = re-score turns judged with another configuration
-dbutils.widgets.dropdown("reset_outputs", "false", ["true", "false"])             # true = drop both output tables before scoring
+dbutils.widgets.dropdown("reset_outputs", "false", ["true", "false"])             # true = drop the output tables before scoring
 dbutils.widgets.dropdown("feedback_to_agent_traces", "false", ["true", "false"])  # true = also attach the verdict to the assistant's trace
 dbutils.widgets.text("source_schema", "uat_landingzone.qualibot")                 # chat_messages / chat_feedbacks
-dbutils.widgets.text("output_schema", "uat_proj.qualibot")                        # chat_quality_scores / chat_quality_scoring_runs
+dbutils.widgets.text("output_schema", "uat_proj.qualibot")                        # output tables and views
 dbutils.widgets.text("experiment_path", "/Shared/qualibot-quality-scoring")
 dbutils.widgets.text("judge_endpoint", "databricks-gpt-5-6-luna")                 # empty = Databricks-managed judge model
 
@@ -103,6 +106,7 @@ JUDGE_ENDPOINT = dbutils.widgets.get("judge_endpoint").strip()
 SOURCE_TABLE = f"{SOURCE_SCHEMA}.chat_messages"
 FEEDBACK_TABLE = f"{SOURCE_SCHEMA}.chat_feedbacks"            # optional: used if it exists
 SCORES_TABLE = f"{OUTPUT_SCHEMA}.chat_quality_scores"
+ASSESSMENTS_TABLE = f"{OUTPUT_SCHEMA}.chat_quality_assessments"
 SCORING_RUNS_TABLE = f"{OUTPUT_SCHEMA}.chat_quality_scoring_runs"
 
 # ── Scope of a run ──
@@ -110,14 +114,13 @@ CHAT_HISTORY_LIMIT = 10                # mirrors CHAT_MAX_HISTORY / _trim_histor
 MIN_TURN_AGE_MINUTES = 60              # wait a bit so the user's next message (implicit feedback) exists
 SAMPLE_RATE = 1.0                      # deterministic sampling on message_id (1.0 = every turn)
 MAX_TURNS_PER_RUN = 3000               # guard-rail for backlogs
-MERGE_BATCH_SIZE = 200                 # rows per MERGE into the scores table
 MAX_PARALLEL_TURNS = 4                 # turns scored in parallel (each turn runs its scorers in parallel too)
 
 # ── Cited document excerpts (RETRIEVER step) ──
 VS_INDEX = "uat_landingzone.qualibot.chunks_index_v1"   # index holding ALL chunks (the ALL assistant's index)
 VS_COLUMNS = ["REF", "chunk_text", "semantic_headers"]
 REF_SOURCE_TABLE = None                # source table of the index; None = read from the index definition
-EXCERPTS_PER_TURN = 12
+EXCERPTS_PER_TURN = 10
 EXCERPT_MAX_CHARS = 1500
 
 # ── Cost estimate (pay-per-token, DBU per 1M tokens) ──
@@ -142,17 +145,16 @@ print(f"dry_run={DRY_RUN} · rescore_changed_config={RESCORE_CHANGED} · reset_o
 # COMMAND ----------
 
 # DBTITLE 1,Connections — workspace, MLflow experiment, output reset
-import json
 import os
-import re
 import time
 
-import mlflow
 from databricks.sdk import WorkspaceClient
 
 w = WorkspaceClient()
 os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = str(MAX_PARALLEL_TURNS)
 os.environ["MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"] = "True"   # the replay needs no preliminary test call
+
+import mlflow
 
 # An MLflow experiment is a workspace object: its parent folder must exist
 _parent = EXPERIMENT_PATH.rsplit("/", 1)[0]
@@ -161,10 +163,275 @@ EXPERIMENT_ID = mlflow.set_experiment(EXPERIMENT_PATH).experiment_id
 
 # The output tables belong to the job identity: resetting them from the job avoids ownership issues
 if RESET_OUTPUTS and not DRY_RUN:
-    for table in (SCORES_TABLE, SCORING_RUNS_TABLE):
+    for table in (SCORES_TABLE, ASSESSMENTS_TABLE, SCORING_RUNS_TABLE):
         spark.sql(f"DROP TABLE IF EXISTS {table}")
-    print(f"Output tables dropped: {SCORES_TABLE}, {SCORING_RUNS_TABLE}")
+    print(f"Output tables dropped: {SCORES_TABLE}, {ASSESSMENTS_TABLE}, {SCORING_RUNS_TABLE}")
 print(f"MLflow {mlflow.__version__} · experiment {EXPERIMENT_PATH} (id {EXPERIMENT_ID})")
+
+# COMMAND ----------
+
+# DBTITLE 1,Shared scorers and helpers — identical in Evaluate_Knowledge_Assistant.py and Score_Production_QA.py
+# This cell is identical in both notebooks (checked by tests/test_shared.py): the same judges score the golden dataset
+# and the production turns, so that their results can be compared in the dashboard.
+import hashlib
+import json
+import re
+from typing import Literal
+
+import mlflow
+from mlflow import MlflowClient
+from mlflow.genai.judges import make_judge
+from mlflow.genai.scorers import delete_scorer, scorer
+from pyspark.sql.types import ArrayType, BooleanType, DoubleType, LongType, StringType
+
+_TEXT_FRAGMENT = re.compile(r"#:~:text=[^)\s\]>]*")
+
+
+def clean_answer(text) -> str:
+    """Answer as read by the judges: the text fragments of citation links (#:~:text=…, often longer than the cited
+    passage itself) are removed; the links and the passages quoted in the footnotes are kept."""
+    return _TEXT_FRAGMENT.sub("", str(text or ""))
+
+
+CONTEXT = """Qualibot is an internal assistant answering questions about the QUALITY documentation of an aerospace
+manufacturer (procedures, work instructions, forms, templates, quality rules) for two divisions: AS (Aerostructures)
+and IS (Interconnection Systems). Documents are identified by codes such as PRLAT508, QP-1457, NF-10065, INAQ619_FR.
+It must answer only from those documents, cite them, answer in the user's language, and say so when the information is
+not in the documentation.
+
+{{ inputs }} holds `messages`, the conversation as the assistant saw it (oldest first; the last user message is the
+question). {{ outputs }} is the assistant answer under evaluation. Write the rationale in English, in one or two
+sentences.
+"""
+
+SHARED_JUDGES = {
+    "relevance": (
+        "The answer addresses what the user asked, given the whole conversation.",
+        CONTEXT + """
+Does the answer address what the user asked, given the whole conversation? When the last user message asks to modify,
+correct or restate the previous answer ("remove document X", "shorter", "same for Y"), judge whether the answer applies
+that request. An appropriate refusal of an out-of-scope request, or a justified "not found", counts as relevant.
+Return yes or no."""),
+    "language_match": (
+        "The answer is written in the language of the user's last message.",
+        CONTEXT + """
+Is the answer written in the language of the last user message? Document titles and codes in another language do not
+count. Return yes or no."""),
+}
+
+
+def shared_llm_judges(model) -> list:
+    kw = {"model": model} if model else {}
+    return [make_judge(name=name, description=desc, instructions=instructions, feedback_value_type=Literal["yes", "no"], **kw)
+            for name, (desc, instructions) in SHARED_JUDGES.items()]
+
+
+@scorer(name="groundedness", description="The answer's claims are supported by the excerpts of the documents it cites "
+                                         "(supported / partially_supported / not_supported).")
+def groundedness(inputs, outputs, trace):
+    """Checks the answer's factual claims against the excerpts of the documents it cites (RETRIEVER step).
+    Not applicable (no assessment) when the answer cites no document found in the index."""
+    from typing import Literal
+
+    from mlflow.entities import SpanType
+    from mlflow.genai.judges import make_judge
+
+    docs = [d if isinstance(d, dict) else d.to_dict()
+            for s in trace.search_spans(span_type=SpanType.RETRIEVER) for d in (s.outputs or [])]
+    if not docs:
+        return None
+    excerpts = "\n---\n".join(f"[{(d.get('metadata') or {}).get('doc_uri')}] {d.get('page_content')}" for d in docs)
+    question = next((m["content"] for m in reversed(inputs["messages"]) if m["role"] == "user"), "")
+    judge = make_judge(
+        name="groundedness",
+        instructions="""You verify an answer of an assistant on aerospace quality documentation. {{ inputs }} holds the
+user's question and EXCERPTS of the documents the answer cites; {{ outputs }} is the answer.
+List mentally the answer's key factual claims (values, thresholds, deadlines, roles, steps, document identities,
+definitions), ignoring greetings, generic advice and questions to the user. The excerpts are only a SUBSET of the
+documents: a claim absent from the excerpts is not verifiable, which is NOT a contradiction.
+Return:
+- supported: every verifiable claim is stated by an excerpt;
+- partially_supported: some claims are only partly supported or close but not exact;
+- not_supported: at least one claim is contradicted by the excerpts, or the excerpts of that document clearly show it
+  does not say this.
+Write the rationale in English and name the unsupported claims, if any.""",
+        feedback_value_type=Literal["supported", "partially_supported", "not_supported"],
+        model=trace.info.tags.get("judge_model") or None)
+    return judge(inputs={"question": question, "excerpts": excerpts}, outputs=outputs)
+
+
+@scorer(name="missed_answer", description="yes when the answer says the information is not available while the excerpts "
+                                          "of the cited documents contain it.")
+def missed_answer(inputs, outputs, trace):
+    """yes when the answer says the information is not available (or leaves a part unanswered) while the excerpts of
+    the cited documents contain it. Not applicable (no assessment) when no excerpt was retrieved."""
+    from typing import Literal
+
+    from mlflow.entities import SpanType
+    from mlflow.genai.judges import make_judge
+
+    docs = [d if isinstance(d, dict) else d.to_dict()
+            for s in trace.search_spans(span_type=SpanType.RETRIEVER) for d in (s.outputs or [])]
+    if not docs:
+        return None
+    excerpts = "\n---\n".join(f"[{(d.get('metadata') or {}).get('doc_uri')}] {d.get('page_content')}" for d in docs)
+    question = next((m["content"] for m in reversed(inputs["messages"]) if m["role"] == "user"), "")
+    judge = make_judge(
+        name="missed_answer",
+        instructions="""{{ inputs }} holds a user's question and excerpts of quality documents; {{ outputs }} is an
+assistant's answer. Return yes if the answer says the information is not available, or leaves a part of the question
+unanswered, while the excerpts DO contain that information; otherwise return no. In the rationale (English), state what
+was missed, if anything.""",
+        feedback_value_type=Literal["yes", "no"],
+        model=trace.info.tags.get("judge_model") or None)
+    return judge(inputs={"question": question, "excerpts": excerpts}, outputs=outputs)
+
+
+@scorer(name="reference_integrity", description="Every document code cited in the answer exists (resolved typos and "
+                                                "documents outside the corpus are accepted).")
+def reference_integrity(trace):
+    """True when every cited document code exists: resolved typos (zero padding) and documents outside the corpus
+    mentioned in the excerpts are accepted; codes found nowhere are reported as unverified."""
+    import json
+
+    from mlflow.entities import Feedback
+
+    tags = trace.info.tags or {}
+    unverified = json.loads(tags.get("unverified_refs", "[]"))
+    notes = []
+    if json.loads(tags.get("approximate_refs", "[]")):
+        notes.append(f"resolved: {json.loads(tags['approximate_refs'])}")
+    if json.loads(tags.get("unindexed_refs", "[]")):
+        notes.append(f"outside the corpus: {json.loads(tags['unindexed_refs'])}")
+    if unverified:
+        notes.append(f"unverified: {unverified}")
+    return Feedback(value=not unverified, rationale="; ".join(notes) or "all cited codes exist")
+
+
+SHARED_TRACE_SCORERS = [groundedness, missed_answer, reference_integrity]
+
+# ── Numeric form of a verdict: 1 = pass, 0 = fail, 0.5 = partial; counts and durations as is; NULL for labels ──
+SCORE_VALUES = {"yes": 1.0, "no": 0.0, "true": 1.0, "false": 0.0, "full": 1.0, "partial": 0.5, "none": 0.0,
+                "supported": 1.0, "partially_supported": 0.5, "not_supported": 0.0,
+                "no_contradiction": 1.0, "contradiction": 0.0, "correct_refusal": 1.0, "answered_anyway": 0.0,
+                "good": 1.0, "acceptable": 0.5, "bad": 0.0, "up": 1.0, "down": 0.0}
+LABEL_SCORERS = {"question_intent", "question_topic", "answer_type", "user_reaction"}   # categorical: no numeric form
+INVERTED_SCORERS = {"missed_answer"}                                                   # "yes" is the failure
+
+
+def numeric_value(name: str, value):
+    if value is None or name in LABEL_SCORERS:
+        return None
+    if isinstance(value, bool):
+        x = float(value)
+    elif isinstance(value, (int, float)):
+        return float(value)
+    else:
+        x = SCORE_VALUES.get(str(getattr(value, "value", value)).strip().lower())
+    return None if x is None else (1.0 - x if name in INVERTED_SCORERS else x)
+
+
+def assessment_row(a) -> dict:
+    """Name, raw value, rationale, source type and error of an MLflow assessment."""
+    value = getattr(a, "value", None)
+    fb = getattr(a, "feedback", None)
+    err = getattr(fb, "error", None) if fb is not None else None
+    return {"name": a.name, "value": getattr(value, "value", value), "rationale": getattr(a, "rationale", None),
+            "source_type": str(getattr(getattr(a, "source", None), "source_type", "") or "").split(".")[-1].upper(),
+            "error": (getattr(err, "error_message", None) or str(err))[:1000] if err else None}
+
+
+# ── Scorer registration (Judges / Scorers tab), only when the scorer definitions changed ──
+_SCORERS_TAG = "qualibot.scorers_config_id"
+
+
+def scorer_definition(s) -> str:
+    if getattr(s, "instructions", None):
+        return f"{s.name}|{s.instructions}|{getattr(s, 'feedback_value_type', '')}"
+    if getattr(s, "_original_func", None) is not None:
+        return f"{s.name}|{s.model_dump().get('call_source')}"
+    return f"{s.name}|{type(s).__name__}"
+
+
+def scorers_config_id(scorers, *extra) -> str:
+    """Fingerprint of the scorer definitions (instructions, code) and of any extra setting (model, rules)."""
+    payload = json.dumps([scorer_definition(s) for s in scorers] + [str(x) for x in extra])
+    return hashlib.sha1(payload.encode()).hexdigest()[:12]
+
+
+def publish_scorers(scorers, experiment_id: str, config_id: str):
+    """Registers every scorer in the experiment, replacing a registered scorer of the same name. Registration only:
+    nothing is scheduled, so there is no background cost. Skipped when this configuration is already registered."""
+    client = MlflowClient()
+    if client.get_experiment(experiment_id).tags.get(_SCORERS_TAG) == config_id:
+        print(f"Scorers already registered (configuration {config_id}).")
+        return
+    failed = []
+    for s in scorers:
+        try:
+            try:
+                delete_scorer(name=s.name, experiment_id=experiment_id)
+            except Exception:
+                pass                          # not registered yet
+            s.register(name=s.name, experiment_id=experiment_id)
+            print(f"  registered: {s.name}")
+        except Exception as e:
+            failed.append(s.name)
+            print(f"  not registered: {s.name} ({str(e)[:150]})")
+    if not failed:
+        client.set_experiment_tag(experiment_id, _SCORERS_TAG, config_id)
+
+
+# ── Unity Catalog tables: documented DDL, row replacement by key ──
+def _sql_text(text) -> str:
+    return str(text or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def ensure_table(name: str, schema, comment: str, column_docs: dict):
+    """Creates the table with its table and column comments, or adds the columns it lacks."""
+    col = lambda f: f"`{f.name}` {f.dataType.simpleString().upper()} COMMENT '{_sql_text(column_docs.get(f.name, ''))}'"
+    if not spark.catalog.tableExists(name):
+        spark.sql(f"CREATE TABLE {name} ({', '.join(col(f) for f in schema.fields)}) COMMENT '{_sql_text(comment)}'")
+        return
+    existing = set(spark.table(name).columns)
+    missing = [f for f in schema.fields if f.name not in existing]
+    if missing:
+        spark.sql(f"ALTER TABLE {name} ADD COLUMNS ({', '.join(col(f) for f in missing)})")
+
+
+def to_cell(v, field):
+    """Python value → value accepted by the Spark field type (NaN/None, numpy scalars and arrays, casts)."""
+    if hasattr(v, "item") and not isinstance(v, (str, bytes, list, dict)) and getattr(v, "ndim", 0) == 0:
+        v = v.item()
+    if hasattr(v, "tolist") and not isinstance(v, (str, bytes)):
+        v = v.tolist()
+    if v is None or (isinstance(v, float) and v != v):
+        return [] if isinstance(field.dataType, ArrayType) else None
+    t = field.dataType
+    if isinstance(t, ArrayType):
+        return [str(x) for x in v]
+    if isinstance(t, BooleanType):
+        return bool(v)
+    if isinstance(t, LongType):
+        return int(v)
+    if isinstance(t, DoubleType):
+        return float(v)
+    if isinstance(t, StringType):
+        return str(v)
+    return v
+
+
+def replace_rows(table: str, schema, rows: list, keys: list):
+    """Writes rows into the table: existing rows sharing their key values are replaced (idempotent re-runs)."""
+    if not rows:
+        return
+    view = f"_rows_{table.split('.')[-1]}"
+    spark.createDataFrame([tuple(to_cell(r.get(f.name), f) for f in schema.fields) for r in rows], schema) \
+         .createOrReplaceTempView(view)
+    on = " AND ".join(f"t.`{k}` = s.`{k}`" for k in keys)
+    spark.sql(f"MERGE INTO {table} t USING (SELECT DISTINCT {', '.join(keys)} FROM {view}) s ON {on} WHEN MATCHED THEN DELETE")
+    cols = ", ".join(f"`{f.name}`" for f in schema.fields)
+    spark.sql(f"INSERT INTO {table} ({cols}) SELECT {cols} FROM {view}")
 
 # COMMAND ----------
 
@@ -251,148 +518,63 @@ def classify_refs(cited, excerpt_text: str) -> dict:
 
 # COMMAND ----------
 
-# DBTITLE 1,Scorers — LLM judges (make_judge), built-in safety judge, retrieval judges and code scorers
-from typing import Literal
-
-from mlflow.genai.judges import make_judge
-from mlflow.genai.scorers import Safety, scorer
+# DBTITLE 1,Production scorers — conversation labels, completeness, safety, user reaction, citation count
+from mlflow.genai.scorers import Safety
 
 INTENTS = ["definition_acronym", "document_lookup", "procedure_howto", "rule_requirement", "requirement_compliance",
            "comparison_multi_doc", "link_or_navigation", "person_or_org", "chitchat_or_meta", "out_of_scope"]
 ANSWER_TYPES = ["answered", "partial_answer", "not_found", "out_of_scope_refusal", "clarification_request", "error_or_empty"]
-NEXT_SIGNALS = ["no_next_turn", "moves_on", "follow_up", "rephrase_same_question", "correction_or_complaint"]
 
-CONTEXT = """Qualibot is an internal assistant answering questions about the QUALITY documentation of an aerospace
-manufacturer (procedures, work instructions, forms, templates, quality rules) for two divisions: AS (Aerostructures)
-and IS (Interconnection Systems). Documents are identified by codes such as PRLAT508, QP-1457, NF-10065, INAQ619_FR.
-It must answer only from those documents, cite them, answer in the user's language, and say so when the information is
-not in the documentation.
-
-{{ inputs }} holds `messages`, the conversation as the assistant saw it (oldest first; the last user message is the
-question), and `next_user_message`, what the user wrote after the answer (null if nothing). {{ outputs }} is the
-assistant answer under evaluation. Write the rationale in English, in one or two sentences.
-"""
-
-JUDGE_INSTRUCTIONS = {
-    "question_intent": CONTEXT + """
+PRODUCTION_JUDGES = {
+    "question_intent": (
+        "What the last user message asks for.", Literal[tuple(INTENTS)], CONTEXT + """
 Classify what the last user message asks for:
 definition_acronym; document_lookup (find a document or template); procedure_howto; rule_requirement (rule, threshold,
 deadline, responsibility); requirement_compliance (whether the company complies with a customer or standard requirement,
 and which internal documents demonstrate it); comparison_multi_doc; link_or_navigation; person_or_org (a person, a team,
-an organisation); chitchat_or_meta; out_of_scope.""",
-    "question_topic": CONTEXT + """
-Give the topic of the last user message in 2 to 5 English words (e.g. "operator qualification", "FAI after site change").""",
-    "answer_type": CONTEXT + """
+an organisation); chitchat_or_meta; out_of_scope."""),
+    "question_topic": (
+        "Topic of the last user message, in 2 to 5 English words.", str, CONTEXT + """
+Give the topic of the last user message in 2 to 5 English words (e.g. "operator qualification", "FAI after site change")."""),
+    "answer_type": (
+        "Kind of answer given by the assistant.", Literal[tuple(ANSWER_TYPES)], CONTEXT + """
 Classify the answer: answered; partial_answer; not_found (says the documentation does not contain it);
 out_of_scope_refusal (declines an off-topic request); clarification_request (asks the user to clarify instead of
-answering); error_or_empty.""",
-    "relevance": CONTEXT + """
-Does the answer address what the user asked, given the whole conversation? When the last user message asks to modify,
-correct or restate the previous answer ("remove document X", "shorter", "same for Y"), judge whether the answer applies
-that request. An appropriate refusal of an out-of-scope request, or a justified "not found", counts as relevant.
-Return yes or no.""",
-    "completeness": CONTEXT + """
+answering); error_or_empty."""),
+    "completeness": (
+        "How completely the answer covers the question (full / partial / none / not_applicable).",
+        Literal["full", "partial", "none", "not_applicable"], CONTEXT + """
 How completely does the answer cover the question? full; partial (some parts left unanswered); none;
-not_applicable (refusal, "not found" or clarification request).""",
-    "language_match": CONTEXT + """
-Is the answer written in the language of the last user message? Document titles and codes in another language do not
-count. Return yes or no.""",
-    "user_reaction": CONTEXT + """
-Classify the user's next message: no_next_turn (null); moves_on (new unrelated question or thanks); follow_up (natural
-continuation); rephrase_same_question (asks the same thing again: the answer did not help); correction_or_complaint
-(says the answer is wrong, incomplete or unhelpful).""",
-}
-JUDGE_TYPES = {
-    "question_intent": Literal[tuple(INTENTS)],
-    "question_topic": str,
-    "answer_type": Literal[tuple(ANSWER_TYPES)],
-    "relevance": Literal["yes", "no"],
-    "completeness": Literal["full", "partial", "none", "not_applicable"],
-    "language_match": Literal["yes", "no"],
-    "user_reaction": Literal[tuple(NEXT_SIGNALS)],
+not_applicable (refusal, "not found" or clarification request)."""),
 }
 
 
-@scorer(name="groundedness")
-def groundedness(inputs, outputs, trace):
-    """Checks the answer's factual claims against the excerpts of the documents it cites (RETRIEVER step).
-    Not applicable (no assessment) when the answer cites no document found in the index."""
+@scorer(name="user_reaction", description="Implicit feedback carried by the user's next message: no_next_turn, moves_on, "
+                                          "follow_up, rephrase_same_question, correction_or_complaint.")
+def user_reaction(inputs, outputs, trace):
+    """Classifies the user's next message. Free (no judge call) when the user wrote nothing after the answer."""
     from typing import Literal
-
-    from mlflow.entities import SpanType
-    from mlflow.genai.judges import make_judge
-
-    docs = [d if isinstance(d, dict) else d.to_dict()
-            for s in trace.search_spans(span_type=SpanType.RETRIEVER) for d in (s.outputs or [])]
-    if not docs:
-        return None
-    excerpts = "\n---\n".join(f"[{(d.get('metadata') or {}).get('doc_uri')}] {d.get('page_content')}" for d in docs)
-    question = next((m["content"] for m in reversed(inputs["messages"]) if m["role"] == "user"), "")
-    judge = make_judge(
-        name="groundedness",
-        instructions="""You verify an answer of an assistant on aerospace quality documentation. {{ inputs }} holds the
-user's question and EXCERPTS of the documents the answer cites; {{ outputs }} is the answer.
-List mentally the answer's key factual claims (values, thresholds, deadlines, roles, steps, document identities,
-definitions), ignoring greetings, generic advice and questions to the user. The excerpts are only a SUBSET of the
-documents: a claim absent from the excerpts is not verifiable, which is NOT a contradiction.
-Return:
-- supported: every verifiable claim is stated by an excerpt;
-- partially_supported: some claims are only partly supported or close but not exact;
-- not_supported: at least one claim is contradicted by the excerpts, or the excerpts of that document clearly show it
-  does not say this.
-Write the rationale in English and name the unsupported claims, if any.""",
-        feedback_value_type=Literal["supported", "partially_supported", "not_supported"],
-        model=trace.info.tags.get("judge_model") or None)
-    return judge(inputs={"question": question, "excerpts": excerpts}, outputs=outputs)
-
-
-@scorer(name="missed_answer")
-def missed_answer(inputs, outputs, trace):
-    """yes when the answer says the information is not available (or leaves a part unanswered) while the excerpts of
-    the cited documents contain it. Not applicable (no assessment) when no excerpt was retrieved."""
-    from typing import Literal
-
-    from mlflow.entities import SpanType
-    from mlflow.genai.judges import make_judge
-
-    docs = [d if isinstance(d, dict) else d.to_dict()
-            for s in trace.search_spans(span_type=SpanType.RETRIEVER) for d in (s.outputs or [])]
-    if not docs:
-        return None
-    excerpts = "\n---\n".join(f"[{(d.get('metadata') or {}).get('doc_uri')}] {d.get('page_content')}" for d in docs)
-    question = next((m["content"] for m in reversed(inputs["messages"]) if m["role"] == "user"), "")
-    judge = make_judge(
-        name="missed_answer",
-        instructions="""{{ inputs }} holds a user's question and excerpts of quality documents; {{ outputs }} is an
-assistant's answer. Return yes if the answer says the information is not available, or leaves a part of the question
-unanswered, while the excerpts DO contain that information; otherwise return no. In the rationale (English), state what
-was missed, if anything.""",
-        feedback_value_type=Literal["yes", "no"],
-        model=trace.info.tags.get("judge_model") or None)
-    return judge(inputs={"question": question, "excerpts": excerpts}, outputs=outputs)
-
-
-@scorer(name="reference_integrity")
-def reference_integrity(trace):
-    """True when every cited document code exists: resolved typos (zero padding) and documents outside the corpus
-    mentioned in the excerpts are accepted; codes found nowhere are reported as unverified."""
-    import json
 
     from mlflow.entities import Feedback
+    from mlflow.genai.judges import make_judge
 
-    tags = trace.info.tags or {}
-    unverified = json.loads(tags.get("unverified_refs", "[]"))
-    notes = []
-    if json.loads(tags.get("approximate_refs", "[]")):
-        notes.append(f"resolved: {json.loads(tags['approximate_refs'])}")
-    if json.loads(tags.get("unindexed_refs", "[]")):
-        notes.append(f"outside the corpus: {json.loads(tags['unindexed_refs'])}")
-    if unverified:
-        notes.append(f"unverified: {unverified}")
-    return Feedback(value=not unverified, rationale="; ".join(notes) or "all cited codes exist")
+    next_message = (inputs or {}).get("next_user_message")
+    if not next_message:
+        return Feedback(value="no_next_turn", rationale="The user wrote nothing after this answer.")
+    question = next((m["content"] for m in reversed(inputs["messages"]) if m["role"] == "user"), "")
+    judge = make_judge(
+        name="user_reaction",
+        instructions="""{{ inputs }} holds a user's question to an assistant on quality documentation and the message the
+user wrote right after the assistant's answer, which is {{ outputs }}. Classify that next message:
+moves_on (new unrelated question, or thanks); follow_up (natural continuation of the topic); rephrase_same_question
+(asks the same thing again: the answer did not help); correction_or_complaint (says the answer is wrong, incomplete or
+unhelpful). Write the rationale in English, in one sentence.""",
+        feedback_value_type=Literal["moves_on", "follow_up", "rephrase_same_question", "correction_or_complaint"],
+        model=trace.info.tags.get("judge_model") or None)
+    return judge(inputs={"question": question, "next_user_message": next_message}, outputs=outputs)
 
 
-@scorer(name="citation_count")
+@scorer(name="citation_count", description="Number of documents the assistant listed as sources.")
 def citation_count(trace):
     """Number of documents the assistant listed as sources."""
     import json
@@ -401,10 +583,11 @@ def citation_count(trace):
 
 
 def build_scorers(model):
+    """(LLM judges called for every turn, trace judges called when applicable, code scorers)."""
     kw = {"model": model} if model else {}
-    llm = [make_judge(name=n, instructions=JUDGE_INSTRUCTIONS[n], feedback_value_type=JUDGE_TYPES[n], **kw)
-           for n in JUDGE_INSTRUCTIONS] + [Safety(**kw)]
-    return llm, [groundedness, missed_answer], [reference_integrity, citation_count]
+    every_turn = [make_judge(name=n, description=d, feedback_value_type=t, instructions=i, **kw)
+                  for n, (d, t, i) in PRODUCTION_JUDGES.items()] + shared_llm_judges(model) + [Safety(**kw)]
+    return every_turn, [user_reaction, groundedness, missed_answer], [reference_integrity, citation_count]
 
 # COMMAND ----------
 
@@ -444,14 +627,10 @@ def turn_verdict(v: dict) -> tuple:
         warn.append("user_rephrased")
     return ("bad" if bad else "acceptable" if warn else "good"), bad + warn
 
-
 # COMMAND ----------
 
 # DBTITLE 1,Judge check and registration — the judge model answers, otherwise fall back to the Databricks-managed judge
-import hashlib
 import inspect
-
-from mlflow.genai.scorers import delete_scorer
 
 JUDGE_MODEL = f"databricks:/{JUDGE_ENDPOINT}" if JUDGE_ENDPOINT else None
 _sample = {"inputs": {"messages": [{"role": "user", "content": "Quelle est la durée de conservation des enregistrements ?"}],
@@ -471,35 +650,15 @@ def _judge_works(model) -> bool:
 if JUDGE_MODEL and not DRY_RUN and not _judge_works(JUDGE_MODEL):
     print("   → falling back to the Databricks-managed judge model.")
     JUDGE_MODEL = None
-LLM_JUDGES, RETRIEVAL_JUDGES, CODE_SCORERS = build_scorers(JUDGE_MODEL)
-SCORERS = LLM_JUDGES + RETRIEVAL_JUDGES + CODE_SCORERS
+LLM_JUDGES, TRACE_JUDGES, CODE_SCORERS = build_scorers(JUDGE_MODEL)
+SCORERS = LLM_JUDGES + TRACE_JUDGES + CODE_SCORERS
 
-# Fingerprint of everything that determines a score: any change produces a new identifier
-JUDGE_CONFIG_ID = hashlib.sha1(json.dumps(
-    [JUDGE_MODEL, JUDGE_INSTRUCTIONS, {k: str(v) for k, v in JUDGE_TYPES.items()},
-     [s.model_dump().get("call_source") for s in RETRIEVAL_JUDGES + CODE_SCORERS],
-     inspect.getsource(turn_verdict), EXCERPTS_PER_TURN, CHAT_HISTORY_LIMIT],
-    sort_keys=True).encode()).hexdigest()[:12]
-
-
-def publish_scorers(scorers, experiment_id):
-    """Registers every scorer in the experiment (Judges / Scorers tab), replacing a registered scorer of the same name.
-    Registration only: nothing is scheduled, so there is no background cost."""
-    for s in scorers:
-        try:
-            try:
-                delete_scorer(name=s.name, experiment_id=experiment_id)
-            except Exception:
-                pass                          # not registered yet
-            s.register(name=s.name, experiment_id=experiment_id)
-            print(f"  registered: {s.name}")
-        except Exception as e:
-            print(f"  not registered: {s.name} ({str(e)[:150]})")
-
-
+# Fingerprint of everything that determines a score: scorers, judge model, verdict rules, excerpts, history window
+JUDGE_CONFIG_ID = scorers_config_id(SCORERS, JUDGE_MODEL, inspect.getsource(turn_verdict),
+                                    EXCERPTS_PER_TURN, CHAT_HISTORY_LIMIT)
 print(f"Judge model: {JUDGE_MODEL or 'Databricks-managed'} · {len(SCORERS)} scorers · judge_config_id={JUDGE_CONFIG_ID}")
 if not DRY_RUN:
-    publish_scorers(SCORERS, EXPERIMENT_ID)
+    publish_scorers(SCORERS, EXPERIMENT_ID, JUDGE_CONFIG_ID)
 
 # COMMAND ----------
 
@@ -606,10 +765,10 @@ def trim_history(messages: list, limit: int = CHAT_HISTORY_LIMIT) -> list:
 
 
 def compact(messages: list, older_chars: int = 1200, recent_chars: int = 4000) -> list:
-    """Older messages are truncated for the judges; the two most recent ones are kept almost whole because follow-up
-    requests ("remove document X", "same for Y") can only be judged against them."""
+    """Conversation as given to the judges: citation text fragments removed, older messages truncated; the two most
+    recent ones are kept almost whole because follow-up requests can only be judged against them."""
     n = len(messages)
-    return [{"role": m["role"], "content": m["content"][:recent_chars if i >= n - 2 else older_chars]}
+    return [{"role": m["role"], "content": clean_answer(m["content"])[:recent_chars if i >= n - 2 else older_chars]}
             for i, m in enumerate(messages)]
 
 
@@ -624,11 +783,11 @@ def _text(v):
 TURNS = {}
 for _, row in pdf_pairs.iterrows():
     thread = compact(trim_history(to_messages(row["prior_messages"])))
-    answer = str(row["answer"] or "")
+    raw_answer = str(row["answer"] or "")
     TURNS[str(row["message_id"])] = {
-        "row": row, "thread": thread, "question": last_user_question(thread), "answer": answer,
+        "row": row, "thread": thread, "question": last_user_question(thread), "answer": clean_answer(raw_answer),
         "next_user_message": (_text(row.get("next_user_message")) or "")[:800] or None,
-        "source_refs": source_refs(row["sources_json"]), "cited_refs": sorted(code_like(answer)),
+        "source_refs": source_refs(row["sources_json"]), "cited_refs": sorted(code_like(raw_answer)),
     }
 RECORDS = [{"inputs": {"messages": t["thread"], "next_user_message": t["next_user_message"], "message_id": mid}}
            for mid, t in TURNS.items()]
@@ -675,14 +834,12 @@ def replay_turn(messages, next_user_message, message_id):
 
 # COMMAND ----------
 
-# DBTITLE 1,Run — scoring (mlflow.genai.evaluate), verdicts, votes
+# DBTITLE 1,Run — scoring with mlflow.genai.evaluate (one trace per turn)
 from datetime import datetime, timezone
 
 import pandas as pd
-from mlflow.entities import AssessmentSource, AssessmentSourceType
 
 RUN_TS = datetime.now(timezone.utc).isoformat(timespec="seconds")
-N_LLM_JUDGES = len(LLM_JUDGES)
 t_start = time.time()
 MLFLOW_RUN_ID = None
 results = {}
@@ -691,9 +848,11 @@ results = {}
 def estimated_usage(t: dict) -> tuple:
     """(judge calls, input tokens, output tokens) of one turn, estimated from the prompt sizes."""
     prompt_chars = len(json.dumps(t["thread"], ensure_ascii=False)) + len(t["answer"]) + 2500
-    calls = N_LLM_JUDGES + (len(RETRIEVAL_JUDGES) if (t["source_refs"] or t["cited_refs"]) and REFS_BY_BASE else 0)
-    excerpt_chars = (calls - N_LLM_JUDGES) * EXCERPTS_PER_TURN * 1200
-    tokens_in = (calls * prompt_chars + excerpt_chars) / CHARS_PER_TOKEN
+    retrieval = 2 if (t["source_refs"] or t["cited_refs"]) and REFS_BY_BASE else 0
+    reaction = 1 if t["next_user_message"] else 0
+    calls = len(LLM_JUDGES) + retrieval + reaction
+    tokens_in = (len(LLM_JUDGES) * prompt_chars + retrieval * (EXCERPTS_PER_TURN * EXCERPT_MAX_CHARS + len(t["answer"]))
+                 + reaction * 3000) / CHARS_PER_TOKEN
     return calls, tokens_in, calls * OUTPUT_TOKENS_PER_JUDGE_CALL
 
 
@@ -701,24 +860,14 @@ def cost_usd(tokens_in, tokens_out) -> float:
     return (tokens_in * DBU_PER_M_INPUT + tokens_out * DBU_PER_M_OUTPUT) / 1e6 * USD_PER_DBU
 
 
-def _value(a):
-    v = getattr(a, "value", None)
-    return getattr(v, "value", v)
-
-
-def _error(a):
-    fb = getattr(a, "feedback", None)
-    err = getattr(fb, "error", None) if fb is not None else None
-    return (getattr(err, "error_message", None) or str(err)) if err else None
-
-
 if not TURNS:
     print("Nothing new to score.")
 elif DRY_RUN:
     usage = [estimated_usage(t) for t in TURNS.values()]
     calls, t_in, t_out = (sum(u[i] for u in usage) for i in range(3))
-    print(f"DRY RUN (nothing is scored or written) · {len(TURNS)} turns · ~{calls} judge calls · "
-          f"~{t_in / 1e6:.2f}M in / ~{t_out / 1e6:.2f}M out tokens · ≈ ${cost_usd(t_in, t_out):.2f}")
+    print(f"DRY RUN (nothing is scored or written) · {len(TURNS)} turns · ~{calls} judge calls "
+          f"({calls / len(TURNS):.1f} per turn) · ~{t_in / 1e6:.2f}M in / ~{t_out / 1e6:.2f}M out tokens · "
+          f"≈ ${cost_usd(t_in, t_out):.2f}")
 else:
     with mlflow.start_run(run_name=f"quality-scoring {RUN_TS}") as run:
         MLFLOW_RUN_ID = run.info.run_id
@@ -727,26 +876,20 @@ else:
         mlflow.log_params({"n_turns": len(TURNS), "test_limit": TEST_LIMIT, "excerpts_per_turn": EXCERPTS_PER_TURN})
         mlflow.genai.evaluate(data=RECORDS, predict_fn=replay_turn, scorers=SCORERS)
 
-    # One result per trace: scorer values, rationales and errors
-    for tr in mlflow.search_traces(locations=[EXPERIMENT_ID], run_id=MLFLOW_RUN_ID, return_type="list", include_spans=False,
-                                   max_results=len(TURNS) + 100):
+    # Scores are read back from the traces (tags and assessments only)
+    for tr in mlflow.search_traces(locations=[EXPERIMENT_ID], run_id=MLFLOW_RUN_ID, return_type="list",
+                                   include_spans=False, max_results=len(TURNS) + 100):
         tags = tr.info.tags or {}
-        if tags.get("message_id") not in TURNS:
-            continue
-        vals, why, errs = {}, {}, []
-        for a in (tr.info.assessments or []):
-            if _error(a):
-                errs.append(f"{a.name}: {_error(a)[:200]}")
-            elif _value(a) is not None:
-                vals[a.name], why[a.name] = _value(a), getattr(a, "rationale", None)
-        if tags.get("retrieval_error"):
-            errs.append(f"vector_search: {tags['retrieval_error']}")
-        results[tags["message_id"]] = {"trace_id": tr.info.trace_id, "tags": tags, "values": vals, "why": why, "errors": errs}
+        if tags.get("message_id") in TURNS:
+            results[tags["message_id"]] = {"trace_id": tr.info.trace_id, "tags": tags,
+                                           "assessments": [assessment_row(a) for a in (tr.info.assessments or [])]}
     print(f"{len(results)}/{len(TURNS)} turns scored in {time.time() - t_start:.0f} s · run {MLFLOW_RUN_ID}")
 
 # COMMAND ----------
 
-# DBTITLE 1,Records — one row per turn, verdict and user vote attached to the scoring trace
+# DBTITLE 1,Records — one row per turn and one per turn × scorer; verdict and user vote attached to the trace
+from mlflow.entities import AssessmentSource, AssessmentSourceType
+
 RULE_SOURCE = AssessmentSource(source_type=AssessmentSourceType.CODE, source_id="turn_verdict_rules")
 USER_SOURCE = AssessmentSource(source_type=AssessmentSourceType.HUMAN, source_id="chat_user")
 REQUIRED = {"answer_type", "relevance", "question_intent"}      # without them the verdict is not meaningful
@@ -763,10 +906,18 @@ def _yes(v):
 
 
 def build_record(mid: str) -> dict:
-    t, res = TURNS[mid], results.get(mid, {"trace_id": None, "tags": {}, "values": {}, "why": {}, "errors": ["not scored"]})
-    row, v, why, tags = t["row"], res["values"], res["why"], res["tags"]
-    ok = REQUIRED <= set(v)
-    verdict, reasons = turn_verdict(v) if ok else (None, ["judge_failed"])
+    t = TURNS[mid]
+    res = results.get(mid, {"trace_id": None, "tags": {}, "assessments": []})
+    row, tags = t["row"], res["tags"]
+    ok_rows = [a for a in res["assessments"] if not a["error"] and a["value"] is not None]
+    v = {a["name"]: a["value"] for a in ok_rows}
+    why = {a["name"]: a["rationale"] for a in ok_rows}
+    errors = [f"{a['name']}: {a['error'][:200]}" for a in res["assessments"] if a["error"]]
+    if not res["trace_id"]:
+        errors.append("turn not scored")
+    if tags.get("retrieval_error"):
+        errors.append(f"vector_search: {tags['retrieval_error']}")
+    verdict, reasons = turn_verdict(v) if REQUIRED <= set(v) else (None, ["judge_failed"])
     vote = _text(row.get("feedback_vote"))
     disagreement = (verdict == "good" and vote == "down") or (verdict == "bad" and vote == "up")
     review = bool(verdict) and bool(disagreement or in_calibration_sample(mid))
@@ -805,12 +956,30 @@ def build_record(mid: str) -> dict:
         "review_reason": "judge_vs_user_disagreement" if disagreement and review else "calibration_sample" if review else None,
         "golden_candidate": verdict == "bad" or vote == "down",
         "judge_model": JUDGE_MODEL or "databricks-managed", "judge_config_id": JUDGE_CONFIG_ID,
-        "judge_errors": res["errors"], "n_judge_calls": calls,
+        "judge_errors": errors, "n_judge_calls": calls,
         "estimated_cost_usd": round(cost_usd(t_in, t_out), 6), "scored_at": RUN_TS,
     }
 
 
+def assessment_records(mid: str, record: dict) -> list:
+    """One row per scorer of the turn, plus the rule-based verdict and the user's vote."""
+    base = {k: record[k] for k in ("message_id", "created_at", "endpoint_name", "division", "scoring_trace_id",
+                                   "mlflow_run_id", "judge_config_id", "scored_at")}
+    items = list(results.get(mid, {}).get("assessments", []))
+    if record["turn_verdict"]:
+        items.append({"name": "turn_verdict", "value": record["turn_verdict"], "source_type": "CODE", "error": None,
+                      "rationale": ", ".join(record["failure_reasons"]) or "no issue"})
+    if record["feedback_vote"] in ("up", "down"):
+        items.append({"name": "user_vote", "value": record["feedback_vote"], "source_type": "HUMAN", "error": None,
+                      "rationale": record["feedback_comment"]})
+    return [{**base, "assessment_name": a["name"], "source_type": a["source_type"],
+             "value": a["value"] if isinstance(a["value"], str) or a["value"] is None else json.dumps(a["value"]),
+             "value_numeric": numeric_value(a["name"], a["value"]), "rationale": a["rationale"], "error": a["error"]}
+            for a in items]
+
+
 records = [build_record(mid) for mid in TURNS] if MLFLOW_RUN_ID else []
+assessment_rows = [a for mid, r in zip(TURNS, records) for a in assessment_records(mid, r)] if records else []
 for r in records:
     if not r["scoring_trace_id"]:
         continue
@@ -827,69 +996,117 @@ df_final = pd.DataFrame(records)
 if len(df_final):
     print("Verdicts:", df_final["turn_verdict"].value_counts(dropna=False).to_dict())
     print("Answer types:", df_final["answer_type"].value_counts(dropna=False).to_dict())
-    print(f"Estimated cost ${df_final['estimated_cost_usd'].sum():.3f} · "
+    print(f"{int(df_final['n_judge_calls'].sum())} judge calls ({df_final['n_judge_calls'].mean():.1f} per turn) · "
+          f"estimated cost ${df_final['estimated_cost_usd'].sum():.3f} · "
           f"{int((df_final['judge_errors'].map(len) > 0).sum())} turn(s) with scorer errors")
 
 # COMMAND ----------
 
-# DBTITLE 1,Output tables — explicit schema, MERGE on message_id, run ledger
-from pyspark.sql.types import (ArrayType, BooleanType, DoubleType, LongType, StringType, StructField, StructType)
+# DBTITLE 1,Unity Catalog tables — documented schemas, rows replaced by key, run ledger
+from pyspark.sql.types import StructField, StructType
 
 S, B, I, D, A = StringType(), BooleanType(), LongType(), DoubleType(), ArrayType(StringType())
-OUT_SCHEMA = StructType([StructField(n, t) for n, t in [
-    ("message_id", MESSAGE_ID_TYPE), ("created_at", CREATED_AT_TYPE), ("session_id", S), ("division", S),
-    ("endpoint_name", S), ("trace_id", S), ("scoring_trace_id", S), ("mlflow_run_id", S),
-    ("user_question", S), ("thread_turn_count", I), ("answer", S), ("next_user_message", S),
-    ("citation_count", I), ("source_refs", A), ("cited_refs", A), ("excerpt_refs", A),
-    ("approximate_refs", A), ("unindexed_refs", A), ("unverified_refs", A),
-    ("feedback_vote", S), ("feedback_comment", S),
-    ("question_intent", S), ("question_topic", S), ("in_scope", S), ("is_follow_up", B), ("answer_type", S),
-    ("relevance__value", B), ("relevance__rationale", S),
-    ("completeness_level", S), ("completeness__value", B), ("completeness__rationale", S),
-    ("language_match__value", B), ("language_match__rationale", S),
-    ("safety__value", B), ("safety__rationale", S),
-    ("grounding_source", S), ("groundedness_level", S), ("groundedness__value", B), ("groundedness__rationale", S),
-    ("missed_answer", B), ("missed_answer_detail", S),
-    ("next_turn_signal", S), ("next_turn_rationale", S),
-    ("turn_verdict", S), ("failure_reasons", A), ("needs_human_review", B), ("review_reason", S),
-    ("golden_candidate", B), ("judge_model", S), ("judge_config_id", S), ("judge_errors", A),
-    ("n_judge_calls", I), ("estimated_cost_usd", D), ("scored_at", S)]])
+_VERDICT_DOC = "good / acceptable / bad, from the verdict rules of the scoring notebook; NULL when the judges failed"
 
+SCORES_COLUMNS = [
+    ("message_id", MESSAGE_ID_TYPE, "Assistant message id (chat_messages.id); one row per scored assistant turn"),
+    ("created_at", CREATED_AT_TYPE, "Time of the assistant answer"),
+    ("session_id", S, "Conversation id"),
+    ("division", S, "Division selected in the app: ALL, AS or IS"),
+    ("endpoint_name", S, "Knowledge Assistant serving endpoint that answered"),
+    ("trace_id", S, "MLflow trace id of the assistant's own answer"),
+    ("scoring_trace_id", S, "MLflow trace id of the scoring (scoring experiment, Traces tab)"),
+    ("mlflow_run_id", S, "MLflow run of the scoring run that produced the row"),
+    ("user_question", S, "Last user message before the answer (division prefix removed)"),
+    ("thread_turn_count", I, "Messages in the conversation window seen by the assistant"),
+    ("answer", S, "Assistant answer, without citation text fragments, truncated to 4000 characters"),
+    ("next_user_message", S, "Message the user wrote after the answer, if any"),
+    ("citation_count", I, "Documents listed by the assistant as sources"),
+    ("source_refs", A, "Document codes listed by the assistant as sources"),
+    ("cited_refs", A, "Document codes cited in the answer text"),
+    ("excerpt_refs", A, "Documents whose excerpts were checked by the retrieval judges"),
+    ("approximate_refs", A, "Cited codes resolved despite a typo (e.g. IN_APO_006 → IN_APO_0006)"),
+    ("unindexed_refs", A, "Cited codes absent from the index but mentioned in the excerpts (documents outside the corpus)"),
+    ("unverified_refs", A, "Cited codes found neither in the index nor in the excerpts (possibly invented)"),
+    ("feedback_vote", S, "User vote on the answer: up, down or NULL"),
+    ("feedback_comment", S, "User comment attached to the vote"),
+    ("question_intent", S, "Judge label: kind of question (definition_acronym, document_lookup, requirement_compliance…)"),
+    ("question_topic", S, "Judge label: topic of the question in 2 to 5 English words"),
+    ("in_scope", S, "yes unless the intent is out_of_scope or chitchat_or_meta"),
+    ("is_follow_up", B, "The conversation had earlier user messages"),
+    ("answer_type", S, "Judge label: answered, partial_answer, not_found, out_of_scope_refusal, clarification_request, error_or_empty"),
+    ("relevance__value", B, "Judge: the answer addresses the question"),
+    ("relevance__rationale", S, "Rationale of the relevance judge"),
+    ("completeness_level", S, "Judge: full, partial, none or not_applicable"),
+    ("completeness__value", B, "completeness_level is full or not_applicable"),
+    ("completeness__rationale", S, "Rationale of the completeness judge"),
+    ("language_match__value", B, "Judge: the answer is in the language of the question"),
+    ("language_match__rationale", S, "Rationale of the language judge"),
+    ("safety__value", B, "Judge: no harmful content"),
+    ("safety__rationale", S, "Rationale of the safety judge"),
+    ("grounding_source", S, "cited_documents when the answer could be checked against excerpts, none otherwise"),
+    ("groundedness_level", S, "Judge: supported, partially_supported or not_supported; NULL when nothing could be checked"),
+    ("groundedness__value", B, "groundedness_level is supported"),
+    ("groundedness__rationale", S, "Rationale of the groundedness judge (names the unsupported claims)"),
+    ("missed_answer", B, "Judge: the answer says 'not found' while the cited excerpts contain the information"),
+    ("missed_answer_detail", S, "What was missed, according to the judge"),
+    ("next_turn_signal", S, "Judge label of the user's next message: no_next_turn, moves_on, follow_up, rephrase_same_question, correction_or_complaint"),
+    ("next_turn_rationale", S, "Rationale of the user reaction judge"),
+    ("turn_verdict", S, _VERDICT_DOC),
+    ("failure_reasons", A, "Reasons of a bad or acceptable verdict (unsupported_claims, missed_answer_in_sources, …)"),
+    ("needs_human_review", B, "In the human review queue (judge/user disagreement or calibration sample)"),
+    ("review_reason", S, "judge_vs_user_disagreement or calibration_sample"),
+    ("golden_candidate", B, "Bad verdict or down vote: candidate case for the golden dataset"),
+    ("judge_model", S, "Judge model used"),
+    ("judge_config_id", S, "Fingerprint of the scorers, judge model and verdict rules; compare scores of the same configuration"),
+    ("judge_errors", A, "Scorer errors of the turn"),
+    ("n_judge_calls", I, "Judge model calls made for the turn"),
+    ("estimated_cost_usd", D, "Estimated judge cost of the turn (USD)"),
+    ("scored_at", S, "Start time (UTC) of the scoring run"),
+]
+SCORES_SCHEMA = StructType([StructField(n, t) for n, t, _ in SCORES_COLUMNS])
+SCORES_DOCS = {n: d for n, _, d in SCORES_COLUMNS}
 
-def _clean(v, field):
-    """Python value → value accepted by the Spark field type (NaN/None handling, numpy scalars, casts)."""
-    if hasattr(v, "item") and not isinstance(v, (str, bytes, list, dict)) and getattr(v, "ndim", 0) == 0:
-        v = v.item()
-    if hasattr(v, "tolist") and not isinstance(v, (str, bytes)):
-        v = v.tolist()
-    if v is None or (isinstance(v, float) and v != v):
-        return [] if isinstance(field.dataType, ArrayType) else None
-    t = field.dataType
-    if isinstance(t, ArrayType):
-        return [str(x) for x in v]
-    if isinstance(t, BooleanType):
-        return bool(v)
-    if isinstance(t, LongType):
-        return int(v)
-    if isinstance(t, DoubleType):
-        return float(v)
-    if isinstance(t, StringType):
-        return str(v)
-    return v
+ASSESSMENTS_COLUMNS = [
+    ("message_id", MESSAGE_ID_TYPE, "Assistant message id (chat_messages.id)"),
+    ("created_at", CREATED_AT_TYPE, "Time of the assistant answer"),
+    ("endpoint_name", S, "Knowledge Assistant serving endpoint that answered"),
+    ("division", S, "Division selected in the app"),
+    ("scoring_trace_id", S, "MLflow trace id of the scoring"),
+    ("mlflow_run_id", S, "MLflow run of the scoring run"),
+    ("judge_config_id", S, "Fingerprint of the scorers, judge model and verdict rules"),
+    ("scored_at", S, "Start time (UTC) of the scoring run"),
+    ("assessment_name", S, "Scorer name (relevance, groundedness, …), turn_verdict or user_vote"),
+    ("source_type", S, "LLM_JUDGE, CODE or HUMAN"),
+    ("value", S, "Value as returned by the scorer"),
+    ("value_numeric", D, "Numeric form: 1 = pass, 0 = fail, 0.5 = partial; counts as is; NULL for labels"),
+    ("rationale", S, "Rationale of the scorer"),
+    ("error", S, "Error message when the scorer failed"),
+]
+ASSESSMENTS_SCHEMA = StructType([StructField(n, t) for n, t, _ in ASSESSMENTS_COLUMNS])
+ASSESSMENTS_DOCS = {n: d for n, _, d in ASSESSMENTS_COLUMNS}
 
-
-def merge_rows(rows: list):
-    sdf = spark.createDataFrame([tuple(_clean(r.get(f.name), f) for f in OUT_SCHEMA.fields) for r in rows], OUT_SCHEMA)
-    if not spark.catalog.tableExists(SCORES_TABLE):
-        sdf.write.saveAsTable(SCORES_TABLE)
-        return
-    sdf.createOrReplaceTempView("_scored_batch")
-    spark.sql(f"""
-        MERGE WITH SCHEMA EVOLUTION INTO {SCORES_TABLE} t
-        USING _scored_batch s ON t.message_id = s.message_id
-        WHEN MATCHED THEN UPDATE SET *
-        WHEN NOT MATCHED THEN INSERT *
-    """)
+RUNS_COLUMNS = [
+    ("run_ts", S, "Start time (UTC) of the scoring run"),
+    ("mlflow_run_id", S, "MLflow run of the scoring run"),
+    ("judge_model", S, "Judge model used"),
+    ("judge_config_id", S, "Fingerprint of the scorers, judge model and verdict rules"),
+    ("n_messages", I, "Turns scored"),
+    ("n_judge_calls", I, "Judge model calls"),
+    ("estimated_cost_usd", D, "Estimated judge cost (USD)"),
+    ("duration_s", D, "Duration of the run (seconds)"),
+    ("n_judge_errors", I, "Turns with at least one scorer error"),
+    ("good_rate", D, "Share of good verdicts"),
+    ("bad_rate", D, "Share of bad verdicts"),
+    ("refusal_rate", D, "Share of not_found and out_of_scope_refusal answers"),
+    ("groundedness_rate", D, "Share of supported answers among those checked against excerpts"),
+    ("grounding_coverage", D, "Share of answers checked against excerpts"),
+    ("judge_user_agreement", D, "Agreement between the verdict (bad / not bad) and the user votes"),
+    ("n_voted", I, "Scored turns with a user vote"),
+    ("n_needs_human_review", I, "Turns added to the human review queue"),
+]
+RUNS_SCHEMA = StructType([StructField(n, t) for n, t, _ in RUNS_COLUMNS])
+RUNS_DOCS = {n: d for n, _, d in RUNS_COLUMNS}
 
 
 def rate(series, value=True):
@@ -899,8 +1116,15 @@ def rate(series, value=True):
 
 run_row = None
 if len(df_final):
-    for start in range(0, len(records), MERGE_BATCH_SIZE):
-        merge_rows(records[start:start + MERGE_BATCH_SIZE])
+    ensure_table(SCORES_TABLE, SCORES_SCHEMA, "Qualibot production turns scored by LLM judges: one row per assistant "
+                 "turn (labels, verdicts, rationales, references). Written by the quality scoring job.", SCORES_DOCS)
+    ensure_table(ASSESSMENTS_TABLE, ASSESSMENTS_SCHEMA, "Qualibot production scoring: one row per assistant turn and "
+                 "scorer, including the rule-based turn_verdict and the user's vote.", ASSESSMENTS_DOCS)
+    ensure_table(SCORING_RUNS_TABLE, RUNS_SCHEMA, "Qualibot production scoring runs: volumes, rates and estimated cost.",
+                 RUNS_DOCS)
+    replace_rows(SCORES_TABLE, SCORES_SCHEMA, records, ["message_id"])
+    replace_rows(ASSESSMENTS_TABLE, ASSESSMENTS_SCHEMA, assessment_rows, ["message_id"])
+
     voted = df_final[df_final["feedback_vote"].isin(["up", "down"]) & df_final["turn_verdict"].notna()]
     agree = round(float(((voted["turn_verdict"] != "bad") == (voted["feedback_vote"] == "up")).mean()), 4) if len(voted) else None
     run_row = {
@@ -917,14 +1141,59 @@ if len(df_final):
         "judge_user_agreement": agree, "n_voted": int(len(voted)),
         "n_needs_human_review": int(df_final["needs_human_review"].sum()),
     }
-    RUNS_SCHEMA = StructType([StructField(k, t) for k, t in [
-        ("run_ts", S), ("mlflow_run_id", S), ("judge_model", S), ("judge_config_id", S), ("n_messages", I),
-        ("n_judge_calls", I), ("estimated_cost_usd", D), ("duration_s", D), ("n_judge_errors", I), ("good_rate", D),
-        ("bad_rate", D), ("refusal_rate", D), ("groundedness_rate", D), ("grounding_coverage", D),
-        ("judge_user_agreement", D), ("n_voted", I), ("n_needs_human_review", I)]])
-    (spark.createDataFrame([tuple(_clean(run_row[f.name], f) for f in RUNS_SCHEMA.fields)], RUNS_SCHEMA)
-          .write.mode("append").option("mergeSchema", "true").saveAsTable(SCORING_RUNS_TABLE))
-    print(json.dumps(run_row, indent=1, default=str))
+    replace_rows(SCORING_RUNS_TABLE, RUNS_SCHEMA, [run_row], ["mlflow_run_id"])
+    print(f"✓ {len(records)} rows → {SCORES_TABLE} · {len(assessment_rows)} rows → {ASSESSMENTS_TABLE} · "
+          f"1 row → {SCORING_RUNS_TABLE}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Dashboard views — daily quality, scorers over time, failure reasons, review queue
+VIEWS = {
+    "v_chat_quality_daily": ("Daily quality per assistant, division and judge configuration", f"""
+        SELECT DATE(created_at) AS day, endpoint_name, division, judge_config_id,
+               COUNT(*) AS n_turns,
+               COUNT_IF(turn_verdict = 'good') AS n_good,
+               COUNT_IF(turn_verdict = 'acceptable') AS n_acceptable,
+               COUNT_IF(turn_verdict = 'bad') AS n_bad,
+               AVG(IF(turn_verdict = 'bad', 1.0, 0.0)) AS bad_rate,
+               AVG(IF(turn_verdict = 'good', 1.0, 0.0)) AS good_rate,
+               AVG(CAST(groundedness__value AS DOUBLE)) AS groundedness_rate,
+               AVG(CAST(missed_answer AS DOUBLE)) AS missed_answer_rate,
+               AVG(IF(answer_type IN ('not_found', 'out_of_scope_refusal'), 1.0, 0.0)) AS refusal_rate,
+               AVG(IF(SIZE(unverified_refs) > 0, 1.0, 0.0)) AS unverified_reference_rate,
+               COUNT_IF(feedback_vote = 'up') AS n_votes_up,
+               COUNT_IF(feedback_vote = 'down') AS n_votes_down,
+               SUM(estimated_cost_usd) AS estimated_cost_usd
+        FROM {SCORES_TABLE}
+        WHERE turn_verdict IS NOT NULL
+        GROUP BY ALL"""),
+    "v_chat_quality_scorers_daily": ("Daily mean of every scorer (numeric form: 1 = pass, 0 = fail) per assistant", f"""
+        SELECT DATE(created_at) AS day, endpoint_name, division, judge_config_id, assessment_name, source_type,
+               COUNT(*) AS n, AVG(value_numeric) AS mean_value, COUNT_IF(error IS NOT NULL) AS n_errors
+        FROM {ASSESSMENTS_TABLE}
+        GROUP BY ALL"""),
+    "v_chat_quality_labels_daily": ("Daily counts of the categorical labels (intent, answer type, user reaction)", f"""
+        SELECT DATE(created_at) AS day, endpoint_name, division, assessment_name, value AS label, COUNT(*) AS n
+        FROM {ASSESSMENTS_TABLE}
+        WHERE assessment_name IN ('question_intent', 'answer_type', 'user_reaction', 'turn_verdict') AND error IS NULL
+        GROUP BY ALL"""),
+    "v_chat_quality_failure_reasons": ("One row per failure reason of a scored turn", f"""
+        SELECT DATE(created_at) AS day, endpoint_name, division, question_intent, turn_verdict, reason,
+               message_id, user_question, scoring_trace_id
+        FROM {SCORES_TABLE} LATERAL VIEW explode(failure_reasons) r AS reason
+        WHERE turn_verdict IS NOT NULL"""),
+    "v_chat_quality_review_queue": ("Turns to review by a human, and candidate cases for the golden dataset", f"""
+        SELECT created_at, endpoint_name, division, review_reason, golden_candidate, turn_verdict, failure_reasons,
+               question_intent, user_question, answer, feedback_vote, feedback_comment, groundedness__rationale,
+               missed_answer_detail, scoring_trace_id, message_id
+        FROM {SCORES_TABLE}
+        WHERE needs_human_review OR golden_candidate"""),
+}
+
+if spark.catalog.tableExists(SCORES_TABLE) and spark.catalog.tableExists(ASSESSMENTS_TABLE):
+    for name, (comment, query) in VIEWS.items():
+        spark.sql(f"CREATE OR REPLACE VIEW {OUTPUT_SCHEMA}.{name} COMMENT '{_sql_text(comment)}' AS {query}")
+    print(f"✓ views: {', '.join(f'{OUTPUT_SCHEMA}.{n}' for n in VIEWS)}")
 
 # COMMAND ----------
 
@@ -993,53 +1262,12 @@ if DRY_RUN:
 elif df_final.empty:
     print("No new turn to score: tables and MLflow are unchanged.")
 else:
-    print(f"Scored turns : {len(df_final)} → {SCORES_TABLE} ({spark.table(SCORES_TABLE).count()} rows in total)")
-    print(f"Run ledger   : 1 row → {SCORING_RUNS_TABLE}")
-    print(f"MLflow       : {EXPERIMENT_PATH} → run {MLFLOW_RUN_ID} (Traces tab: one trace per turn; Judges tab: {len(SCORERS)} scorers)")
-    print(f"Judge config : {JUDGE_CONFIG_ID}")
+    print(f"Tables : {SCORES_TABLE} ({spark.table(SCORES_TABLE).count()} turns in total), {ASSESSMENTS_TABLE}, "
+          f"{SCORING_RUNS_TABLE}")
+    print(f"Views  : {', '.join(f'{OUTPUT_SCHEMA}.{n}' for n in VIEWS)}")
+    print(f"MLflow : {EXPERIMENT_PATH} → run {MLFLOW_RUN_ID} (Traces: one per turn; Judges: {len(SCORERS)} scorers)")
+    print(f"Judge configuration: {JUDGE_CONFIG_ID}")
     display(spark.table(SCORES_TABLE).filter(F.col("scored_at") == RUN_TS)
             .select("created_at", "endpoint_name", "question_intent", "answer_type", "turn_verdict",
                     "failure_reasons", "groundedness_level", "user_question")
             .orderBy(F.col("created_at").desc()))
-
-# COMMAND ----------
-
-# DBTITLE 1,Dashboard queries (Lakeview "ChatBot - Quality" page)
-# MAGIC %md
-# MAGIC ```sql
-# MAGIC -- 1. Daily verdicts per assistant
-# MAGIC SELECT DATE(created_at) AS day, endpoint_name, turn_verdict, COUNT(*) AS n
-# MAGIC FROM uat_proj.qualibot.chat_quality_scores
-# MAGIC GROUP BY ALL;
-# MAGIC
-# MAGIC -- 2. Root causes (what to fix first)
-# MAGIC SELECT reason, COUNT(*) AS n
-# MAGIC FROM uat_proj.qualibot.chat_quality_scores LATERAL VIEW explode(failure_reasons) r AS reason
-# MAGIC WHERE created_at >= current_date() - INTERVAL 30 DAYS
-# MAGIC GROUP BY reason ORDER BY n DESC;
-# MAGIC
-# MAGIC -- 3. Quality per type of question
-# MAGIC SELECT question_intent, COUNT(*) AS n,
-# MAGIC        AVG(CASE WHEN turn_verdict = 'bad' THEN 1 ELSE 0 END) AS bad_rate,
-# MAGIC        AVG(CASE WHEN groundedness__value THEN 1 ELSE 0 END) AS groundedness,
-# MAGIC        AVG(CASE WHEN answer_type IN ('not_found','out_of_scope_refusal') THEN 1 ELSE 0 END) AS refusal_rate
-# MAGIC FROM uat_proj.qualibot.chat_quality_scores GROUP BY question_intent;
-# MAGIC
-# MAGIC -- 4. Documentation gaps: in-scope questions answered "not found" (topics to document or to index better)
-# MAGIC SELECT question_topic, COUNT(*) AS n, max(user_question) AS example
-# MAGIC FROM uat_proj.qualibot.chat_quality_scores
-# MAGIC WHERE answer_type = 'not_found' AND in_scope = 'yes' GROUP BY question_topic ORDER BY n DESC;
-# MAGIC
-# MAGIC -- 5. Judge vs users (calibration)
-# MAGIC SELECT feedback_vote, turn_verdict, COUNT(*) AS n
-# MAGIC FROM uat_proj.qualibot.chat_quality_scores WHERE feedback_vote IS NOT NULL GROUP BY ALL;
-# MAGIC
-# MAGIC -- 6. Human review queue and golden-dataset candidates
-# MAGIC SELECT created_at, endpoint_name, review_reason, user_question, answer, failure_reasons, feedback_vote, feedback_comment
-# MAGIC FROM uat_proj.qualibot.chat_quality_scores
-# MAGIC WHERE needs_human_review OR golden_candidate ORDER BY created_at DESC;
-# MAGIC
-# MAGIC -- 7. Estimated cost per day
-# MAGIC SELECT DATE(run_ts) AS day, SUM(estimated_cost_usd) AS usd, SUM(n_messages) AS turns, SUM(n_judge_calls) AS judge_calls
-# MAGIC FROM uat_proj.qualibot.chat_quality_scoring_runs GROUP BY ALL ORDER BY day;
-# MAGIC ```

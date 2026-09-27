@@ -30,10 +30,18 @@
 ## MLflow design (evaluation and monitoring)
 - Every judge is an MLflow scorer registered in its experiment (Judges / Scorers tab), never scheduled (no background
   cost): `make_judge` judges, built-in judges, and `@scorer` code scorers.
-- The retrieval judges `groundedness` and `missed_answer` are shared, word for word, by the evaluation and the
-  production monitoring. They read the excerpts of the cited documents from the trace's `RETRIEVER` step
-  (`cited_document_excerpts`) and return no assessment when there is none. The excerpts are a subset of the documents:
-  a claim absent from them is "not verifiable", not "not supported".
+- Both notebooks contain the same "Shared scorers and helpers" cell (`tests/test_shared.py` checks it is identical):
+  judges `relevance`, `language_match`, `groundedness`, `missed_answer`, code scorer `reference_integrity`, answer
+  cleaning (citation `#:~:text=` fragments removed before judging), numeric form of verdicts, scorer registration and
+  Unity Catalog write helpers. Edit it in one notebook and copy it to the other.
+- The retrieval judges `groundedness` and `missed_answer` read the excerpts of the cited documents from the trace's
+  `RETRIEVER` step (`cited_document_excerpts`) and return no assessment when there is none. The excerpts are a subset of
+  the documents: a claim absent from them is "not verifiable", not "not supported".
+- Judges are skipped when not applicable: `user_reaction` only when the user wrote again (otherwise `no_next_turn`,
+  free), retrieval judges only when the answer cites indexed documents. Scorers are registered again only when their
+  fingerprint changes (experiment tag `qualibot.scorers_config_id`).
+- Dashboard data: documented Unity Catalog tables and views in `uat_proj.qualibot` (catalogue in `README.md`,
+  "Dashboard data"); rows are replaced by key (`message_id` in production, `run_id` in evaluation).
 - Production monitoring replays the stored answers through `mlflow.genai.evaluate` (`replay_turn`), so each scored turn
   is a trace with its conversation, answer, excerpts, every verdict, the rule-based `turn_verdict` and the user's vote.
 - Evaluation runs on the full golden dataset are linked to it by `evaluate`; sampled runs are linked with `log_input`.
@@ -81,7 +89,8 @@
 
 ## Checks before handing over a change
 - `python -m py_compile` on every modified notebook; `databricks bundle validate -t qualibot-uat`.
-- Run the local tests (`README.md`, "Local tests") on the minimum MLflow version (3.11) and on the latest one.
+- Run the local tests (`README.md`, "Local tests") on the minimum MLflow version (3.11) and on the latest one, and
+  replay the generated SQL on a real Spark session (`tests/test_sql.py`).
 
 ## Project status
 
@@ -89,9 +98,9 @@
 | Component | State |
 |---|---|
 | Trace migration (`D_2_qualibot-traces-sync`) | Deployed in UAT. Manual runs: `trace_test`, then `trace_ka_all_v2`, then `trace_ka_is_v2,trace_ka_as_v2`. Schedule to unpause with `to_migrate: "*"` once validated. |
-| Production scoring (`D_3_qualibot-quality-scoring`) | Rebuilt on registered MLflow scorers (10 LLM judges, 2 code scorers); tested end to end locally, not yet run in Databricks. Next run: `dry_run=true`, then `reset_outputs=true` with `test_limit=20` (the output schema changed), then a full run, then unpause the schedule. |
-| Evaluation notebook | Retrieval judges shared with monitoring, every scorer registered, dataset linked to every run; tested end to end locally, not yet run in Databricks. |
-| Golden dataset builder | 20-30 cases, compliance-matrix quota, neighbour expansion by `chunk_index`; reuses the existing cache; not yet run in Databricks. |
+| Production scoring (`D_3_qualibot-quality-scoring`) | Registered MLflow scorers (7 to 10 judge calls per turn), tables `chat_quality_*` and 5 views; tested end to end locally, not yet run in Databricks. Next run: `dry_run=true`, then `reset_outputs=true` with `test_limit=20`, then a full run, then unpause the schedule. |
+| Evaluation notebook | Shared scorers with monitoring, every scorer registered, dataset linked to every run, tables `ka_eval_*` and 3 views; tested end to end locally, not yet run in Databricks. |
+| Golden dataset builder | 20-30 cases, compliance-matrix quota, neighbour expansion by `chunk_index`, flat table `ka_eval_golden_cases`; reuses the existing cache; not yet run in Databricks. |
 
 ### Findings from the first evaluation run (25 cases, qualibot_ALL_v2)
 - The raw correctness score (44%) underestimated the assistant: about a third of the failures came from the
@@ -118,7 +127,8 @@
 
 ### Next tasks, in priority order
 1. Run the production scoring (see Delivered) and check the Traces, Judges and Runs tabs of
-   `/Shared/qualibot-quality-scoring`; check that the DEV dashboard only uses columns of the output schema (cell "Output tables").
+   `/Shared/qualibot-quality-scoring` and the tables and views of `uat_proj.qualibot`; build the dashboard on the views
+   (`README.md`, "Dashboard data").
 2. Run `Build_Golden_Dataset.py` with `FORCE = {"reformulations", "evidence_pool", "ka_fresh"}` to benefit from the
    retrieval routes (hypothetical answer, current assistant sources, similar and adjacent chunks), review in section 11,
    export 20-30 cases.

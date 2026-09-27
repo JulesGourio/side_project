@@ -53,18 +53,33 @@ rt = types.ModuleType("databricks.sdk.runtime")
 rt.display = lambda *a, **k: print("[display]", (a[0].to_string()[:1500] if hasattr(a[0], "to_string") else ""))
 sys.modules["databricks.sdk.runtime"] = rt
 
+sql = SparkSQL()
+sql.tables["uat_proj.qualibot.chat_quality_assessments"] = []   # written by the production scoring
 class Spark:
+    catalog = types.SimpleNamespace(tableExists=sql.exists)
     def table(self, name):
         if "eval_cache" in name: raise Exception("no cache table")
+        if name in sql.tables:
+            df = MagicMock(); df.columns = list(pd.DataFrame(sql.tables[name]).columns); return df
         df = MagicMock(); df.select.return_value.distinct.return_value.collect.return_value = [
             types.SimpleNamespace(REF=r) for r in ["IN_APO_0006", "PRLAT549.FR", "PRLAT549_GB", "QP-1457"]]
         return df
+    def sql(self, q, *a):
+        sql.run(q); return MagicMock()
+    def createDataFrame(self, rows, schema): return sql.create_df(rows, schema)
 ns = {"dbutils": types.SimpleNamespace(widgets=Widgets({"run_eval": "true", "sample_n": SAMPLE, "experiment_path": EXP}), library=MagicMock()),
       "spark": Spark(), "display": rt.display}
 run_cells(str(REPO / "Evaluate_Knowledge_Assistant.py"), ns,
-          skip=("Setup", "Human labels", "Judge alignment", "Review export"))
+          skip=("Setup", "Run comparison", "Human labels", "Judge alignment", "Review export"))
 res = ns["collect"](ns["RUN_IDS"][-1])
-print(res.drop(columns=["_why", "answer", "trace_id"], errors="ignore").T.to_string())
+print(res.drop(columns=["_why", "_tags", "_assessments", "expectations", "answer", "trace_id", "outputs", "tags", "source"], errors="ignore").T.to_string()[:3000])
 run = mlflow.get_run(ns["RUN_IDS"][-1])
 print("dataset inputs:", [d.dataset.name for d in run.inputs.dataset_inputs])
 print("judge models used:", sorted({c[1] for c in calls}))
+print("tables:", {t: len(r) for t, r in sql.tables.items()}, "| views:", sorted(sql.views))
+print(pd.DataFrame(sql.tables["uat_proj.qualibot.ka_eval_metrics"])[["metric", "score", "ci_low", "ci_high", "n"]].to_string())
+r = pd.DataFrame(sql.tables["uat_proj.qualibot.ka_eval_results"])
+print(r[["case_id", "question", "correctness", "groundedness", "reference_integrity", "failed_scorers", "expected_sources"]].to_string())
+print("clean answer:", r.loc[r.question.str.contains("APO"), "answer"].iloc[0])
+if os.environ.get("SQL_DUMP"):
+    sql.dump(os.environ["SQL_DUMP"])

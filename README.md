@@ -6,22 +6,58 @@ Working conventions, environment and project status: see `CLAUDE.md`.
 | Notebook | MLflow experiment | What it shows |
 |---|---|---|
 | `Build_Golden_Dataset.py` | evaluation experiment (Datasets tab) | the golden dataset `uat_landingzone.qualibot.qualibot_eval_golden` (20-30 reviewed cases) |
-| `Evaluate_Knowledge_Assistant.py` | `.../qualibot-traces/trace_eval_all_v2` (traces in Unity Catalog) | one run per evaluation, one trace per case, 9 LLM judges and 3 code scorers registered, the golden dataset linked to every run |
+| `Evaluate_Knowledge_Assistant.py` | `.../qualibot-traces/trace_eval_all_v2` (traces in Unity Catalog) | one run per evaluation, one trace per case, 10 LLM judges and 3 code scorers registered, the golden dataset linked to every run |
 | `Score_Production_QA.py` (job D_3) | `/Shared/qualibot-quality-scoring` | one run per scoring run, one trace per production turn, 10 LLM judges and 2 code scorers registered |
 | `Migrate_KA_Traces_To_UC.py` (job D_2) | `.../qualibot-traces/trace_ka_*` | the assistants' own traces, copied to Unity Catalog |
+
+The scorers `relevance`, `language_match`, `groundedness`, `missed_answer` and `reference_integrity` are identical in
+the evaluation and the production monitoring (shared cell of both notebooks), so their results can be compared.
+
+## Dashboard data (Unity Catalog, `uat_proj.qualibot`)
+
+Every table and column carries a Unity Catalog comment. Numeric scores follow one convention everywhere:
+1 = pass, 0 = fail, 0.5 = partial (`missed_answer` is reported as 1 = nothing missed); labels have no numeric form.
+
+| Object | Grain | Written by | Typical use |
+|---|---|---|---|
+| `chat_quality_scores` | assistant turn | production scoring (D_3) | turn-level drill-down: question, answer, labels, verdict, failure reasons, rationales, references |
+| `chat_quality_assessments` | turn × scorer | production scoring | any scorer over time without schema change (`value`, `value_numeric`, `rationale`, `error`) |
+| `chat_quality_scoring_runs` | scoring run | production scoring | volumes, rates, estimated cost, judge/user agreement |
+| `v_chat_quality_daily` | day × assistant × division | view | KPI tiles and trends: bad/good rate, groundedness, missed answers, refusals, votes, cost |
+| `v_chat_quality_scorers_daily` | day × assistant × scorer | view | one line per scorer (mean numeric value) |
+| `v_chat_quality_labels_daily` | day × assistant × label | view | question types, answer types, user reactions, verdicts |
+| `v_chat_quality_failure_reasons` | turn × failure reason | view | what to fix first, by question type |
+| `v_chat_quality_review_queue` | turn | view | human review queue and golden-dataset candidates |
+| `ka_eval_runs` | evaluation run | evaluation notebook | run context: endpoint, subset, judge model, scorer configuration |
+| `ka_eval_metrics` | run × metric | evaluation notebook | scores with 95% confidence intervals |
+| `ka_eval_results` | run × golden case | evaluation notebook | case drill-down: one column per metric, answer, documents, human rating |
+| `ka_eval_assessments` | run × case × scorer | evaluation notebook | rationales, errors, human ratings |
+| `ka_eval_golden_cases` | golden case | golden dataset builder | dataset composition and review progress |
+| `v_ka_eval_metrics` | run × metric | view | score trends per assistant version (same subset and configuration) |
+| `v_ka_eval_case_history` | run × case | view | regressions and unstable cases |
+| `v_quality_shared_scorers` | day or run × scorer | view | shared scorers in production vs on the golden dataset |
+
+Compare scores of the same `judge_config_id` (production) or `scorers_config_id` (evaluation): a change of judges,
+judge model or verdict rules changes the fingerprint.
 
 ## Local tests
 
 The notebooks cannot run outside Databricks; `tests/` runs their real cells locally with a real MLflow tracking store
-(SQLite) and simulated judge model, Vector Search, assistant endpoint and Spark.
+(SQLite) and simulated judge model, Vector Search, assistant endpoint and Spark; the SQL they write (table DDL, views)
+is replayed on a real local Spark session.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install "mlflow==3.11.1" pandas "sqlalchemy<2.0.40"   # minimum supported MLflow
-.venv/bin/python tests/test_scoring.py        # production scoring: 4 scenarios, verdicts, tables, MLflow run
+.venv/bin/python tests/test_scoring.py        # production scoring: 4 scenarios, verdicts, tables, views, MLflow run
 .venv/bin/python tests/test_scoring.py dry    # production scoring dry run
 .venv/bin/python tests/test_eval.py 3         # evaluation on a 3-case sample; "" = full dataset
 .venv/bin/python tests/test_refs.py           # document keys agree across the notebooks
-.venv/bin/pip install pyspark==3.5.3 && .venv/bin/python tests/test_neighbours.py   # neighbour expansion (needs Java)
+.venv/bin/python tests/test_shared.py         # shared cell identical in both notebooks, answer cleaning, numeric scores
+# Real Spark (needs Java): pyspark==3.5.3 and pandas in another environment
+SQL_DUMP=/tmp/scoring.json .venv/bin/python tests/test_scoring.py && SQL_DUMP=/tmp/eval.json .venv/bin/python tests/test_eval.py ""
+.spark/bin/python tests/test_sql.py /tmp/scoring.json /tmp/eval.json   # table DDL with comments, inserts, the 8 views
+.spark/bin/python tests/test_neighbours.py    # neighbour expansion of the golden dataset builder
+.spark/bin/python tests/test_golden_export.py # flat golden cases table
 ```
 
 Registering `@scorer` code scorers is only possible on Databricks: locally, the tests report them as "not registered".

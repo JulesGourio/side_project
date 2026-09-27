@@ -56,21 +56,22 @@ class FakeDF:
     def toPandas(self): return self._pdf
     def collect(self): return [types.SimpleNamespace(REF=r) for r in ["QP-1457", "IN_APO_0006", "PRLAT549.FR", "PRLAT549_GB"]]
     def count(self): return 4
-written = {}
+sql = SparkSQL()
 class Spark:
-    catalog = types.SimpleNamespace(tableExists=lambda t: t in written)
-    def table(self, name): return FakeDF(pdf, columns=["id", "trace_id", "content"])
+    catalog = types.SimpleNamespace(tableExists=sql.exists)
+    def table(self, name):
+        if name in sql.tables:
+            df = FakeDF(pd.DataFrame(sql.tables[name]), columns=list(pd.DataFrame(sql.tables[name]).columns))
+            df.count = lambda: len(sql.tables[name])
+            return df
+        return FakeDF(pdf, columns=["id", "trace_id", "content"])
     def sql(self, q, *a):
-        if "AS bad_rate" in q:
+        sql.run(q)
+        if "AS bad_rate" in q and q.lstrip().startswith("SELECT"):
             return FakeDF(pd.DataFrame({"endpoint_name": ["ka-7679a56e-endpoint"] * 5, "day": pd.date_range("2026-09-17", periods=5),
                                         "n": [20, 20, 20, 20, 20], "bad_rate": [0.1, 0.1, 0.1, 0.1, 0.6]}))
         return FakeDF(pdf)
-    def createDataFrame(self, rows, schema):
-        df = MagicMock(); df._rows = rows
-        df.write.saveAsTable.side_effect = lambda t: written.setdefault(t, []).extend(rows)
-        df.write.mode.return_value.option.return_value.saveAsTable.side_effect = lambda t: written.setdefault(t, []).extend(rows)
-        df.createOrReplaceTempView.side_effect = lambda v: written.setdefault("_merge", []).extend(rows)
-        return df
+    def createDataFrame(self, rows, schema): return sql.create_df(rows, schema)
 
 w = MagicMock()
 w.vector_search_indexes.get_index.return_value.delta_sync_index_spec.source_table = "uat_landingzone.qualibot.chunks_v1"
@@ -84,12 +85,16 @@ databricks.sdk.WorkspaceClient = lambda: w
 ns = {"dbutils": types.SimpleNamespace(widgets=Widgets({"dry_run": "true" if DRY else "false", "experiment_path": "/Shared/qualibot-quality-scoring"}),
                                        library=MagicMock()),
       "spark": Spark(), "display": lambda *a, **k: print("[display]")}
-run_cells(str(REPO / "Score_Production_QA.py"), ns, skip=("Setup", "Dashboard"))
+run_cells(str(REPO / "Score_Production_QA.py"), ns, skip=("Setup",))
 
 if not DRY:
     df = ns["df_final"]
     print(df[["message_id", "turn_verdict", "failure_reasons", "groundedness_level", "missed_answer", "unverified_refs", "approximate_refs", "judge_errors"]].to_string())
-    print("scores rows:", len(written.get("uat_proj.qualibot.chat_quality_scores", [])), "ledger rows:", len(written.get("uat_proj.qualibot.chat_quality_scoring_runs", [])))
+    print("tables:", {t: len(r) for t, r in sql.tables.items()}, "| views:", sorted(sql.views))
+    a = pd.DataFrame(sql.tables["uat_proj.qualibot.chat_quality_assessments"])
+    print(a[a["message_id"] == 2][["assessment_name", "source_type", "value", "value_numeric"]].to_string())
+    ddl = next(q for q in sql.statements if q.startswith("CREATE TABLE uat_proj.qualibot.chat_quality_scores"))
+    print("DDL excerpt:", ddl[:260])
     tr = mlflow.search_traces(experiment_ids=[ns["EXPERIMENT_ID"]], run_id=ns["MLFLOW_RUN_ID"], return_type="list")
     t = [x for x in tr if x.info.tags.get("message_id") == "2"][0]
     print("spans:", [s.name for s in t.data.spans], "| session:", t.info.trace_metadata.get("mlflow.trace.session"))
@@ -100,3 +105,5 @@ if not DRY:
     print("dataset input:", [d.dataset.name for d in run.inputs.dataset_inputs])
     print("metrics:", {k: v for k, v in run.data.metrics.items() if k.startswith(("run/bad", "reason/", "bad_rate"))})
     print("judge calls by name:", pd.Series([c[0] for c in calls]).value_counts().to_dict())
+if os.environ.get("SQL_DUMP"):
+    sql.dump(os.environ["SQL_DUMP"])

@@ -5,8 +5,10 @@ os.environ["MLFLOW_DISABLE_AGENT_HINT"] = "1"
 
 # ── Minimal pyspark stub ──
 class _T:
+    SQL = "string"
     def __init__(self, *a, **k): self.a = a
     def __repr__(self): return type(self).__name__
+    def simpleString(self): return self.SQL
 class StructField:
     def __init__(self, name, dataType, nullable=True): self.name, self.dataType = name, dataType
 class StructType:
@@ -14,9 +16,11 @@ class StructType:
     def __getitem__(self, k): return next(f for f in self.fields if f.name == k)
 class ArrayType(_T):
     def __init__(self, el): self.elementType = el
+    def simpleString(self): return f"array<{self.elementType.simpleString()}>"
 T = types.ModuleType("pyspark.sql.types")
-for n in ["BooleanType", "DoubleType", "LongType", "StringType", "TimestampType", "IntegerType"]:
-    setattr(T, n, type(n, (_T,), {}))
+for n, sql_name in [("BooleanType", "boolean"), ("DoubleType", "double"), ("LongType", "bigint"), ("StringType", "string"),
+                   ("TimestampType", "timestamp"), ("IntegerType", "int")]:
+    setattr(T, n, type(n, (_T,), {"SQL": sql_name}))
 T.StructField, T.StructType, T.ArrayType = StructField, StructType, ArrayType
 pyspark = types.ModuleType("pyspark"); sql = types.ModuleType("pyspark.sql")
 sql.types = T; sql.functions = MagicMock(); pyspark.sql = sql
@@ -68,3 +72,34 @@ class VSResult:
     def __init__(self, rows, cols=("REF", "chunk_text", "semantic_headers")):
         self.manifest = types.SimpleNamespace(columns=[types.SimpleNamespace(name=c) for c in cols])
         self.result = types.SimpleNamespace(data_array=rows)
+
+
+class SparkSQL:
+    """Records the SQL of the notebooks: tables created, rows inserted from temporary views, views created."""
+    def __init__(self):
+        self.tables, self.views, self.temp, self.statements = {}, {}, {}, []
+
+    def exists(self, name): return name in self.tables
+
+    def create_df(self, rows, schema):
+        df = MagicMock(); df._rows = rows
+        df.createOrReplaceTempView.side_effect = lambda v: self.temp.__setitem__(v, (rows, schema))
+        return df
+
+    def run(self, q):
+        self.statements.append(q)
+        m = re.match(r"\s*CREATE TABLE (\S+)", q)
+        if m: self.tables.setdefault(m.group(1), [])
+        m = re.match(r"\s*INSERT INTO (\S+) \(.*?\) SELECT .* FROM (\S+)$", q, re.S)
+        if m:
+            rows, schema = self.temp[m.group(2)]
+            self.tables[m.group(1)].extend(dict(zip([f.name for f in schema.fields], r)) for r in rows)
+        m = re.match(r"\s*CREATE OR REPLACE VIEW (\S+)", q)
+        if m: self.views[m.group(1)] = q
+        m = re.match(r"\s*DROP TABLE IF EXISTS (\S+)", q)
+        if m: self.tables.pop(m.group(1), None)
+
+    def dump(self, path):
+        """Writes the SQL statements and the rows written, for tests/test_sql.py (real Spark)."""
+        with open(path, "w") as f:
+            json.dump({"statements": self.statements, "tables": self.tables}, f, default=str)
