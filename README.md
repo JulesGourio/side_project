@@ -8,6 +8,7 @@ Working conventions, environment and project status: see `CLAUDE.md`.
 | `Build_Golden_Dataset.py` | evaluation experiment (Datasets tab) | the golden dataset `uat_landingzone.qualibot.qualibot_eval_golden` (20-30 reviewed cases) |
 | `Evaluate_Knowledge_Assistant.py` | `.../qualibot-traces/trace_eval_all_v2` (traces in Unity Catalog) | one run per evaluation, one trace per case, 10 LLM judges and 3 code scorers registered, the golden dataset linked to every run |
 | `Score_Production_QA.py` (job D_3) | `/Shared/qualibot-quality-scoring` | one run per scoring run, one trace per production turn, 8 LLM judges and 2 code scorers registered (about 6 judge calls per turn) |
+| `Load_Test_Knowledge_Assistant.py` | `/Shared/qualibot-load-tests` | one run per load test: HTTP 429 and silent retrieval failures (answers without documents) per concurrency level |
 | `Migrate_KA_Traces_To_UC.py` (job D_2) | `.../qualibot-traces/trace_ka_*` | the assistants' own traces, copied to Unity Catalog |
 
 The scorers `relevance`, `language_match`, `groundedness`, `missed_answer` and `reference_integrity` are identical in
@@ -38,6 +39,8 @@ Every table and column carries a Unity Catalog comment. Numeric scores follow on
 | `ka_eval_metrics` | run × metric | evaluation notebook | scores with 95% confidence intervals |
 | `ka_eval_results` | run × golden case | evaluation notebook | case drill-down: one column per metric, answer, documents, human rating |
 | `ka_eval_assessments` | run × case × scorer | evaluation notebook | rationales, errors, human ratings |
+| `ka_load_test_requests` | load test request | load test notebook | status, latency, documents, anomaly of each request |
+| `ka_load_test_summary` | load test × level | load test notebook | 429, silent retrieval failures and latency per concurrency level |
 | `ka_eval_golden_cases` | golden case | golden dataset builder | dataset composition and review progress |
 | `v_ka_eval_metrics` | run × metric | view | score trends per assistant version (same subset and configuration) |
 | `v_ka_eval_case_history` | run × case | view | regressions and unstable cases |
@@ -64,6 +67,7 @@ SQL_DUMP=/tmp/scoring.json .venv/bin/python tests/test_scoring.py && SQL_DUMP=/t
 .spark/bin/python tests/test_sql.py /tmp/scoring.json /tmp/eval.json   # table DDL with comments, inserts, the 8 views
 .spark/bin/python tests/test_neighbours.py    # neighbour expansion of the golden dataset builder
 .spark/bin/python tests/test_golden_export.py # flat golden cases table
+.venv/bin/python tests/test_load.py          # load test against a simulated endpoint (needs requests, databricks-sdk)
 ```
 
 Registering `@scorer` code scorers is only possible on Databricks: locally, the tests report them as "not registered".
