@@ -37,7 +37,8 @@
 # MAGIC
 # MAGIC ### Operations
 # MAGIC - `dry_run=true` estimates the number of judge calls and the cost, and writes nothing.
-# MAGIC - `test_limit` caps the number of turns of an ad-hoc run; `reset_outputs=true` drops the output tables first.
+# MAGIC - `test_limit` caps the number of turns of an ad-hoc run; `reset_outputs=true` scores the turns again from
+# MAGIC   scratch and replaces the output tables once the new scores are ready (a failed run keeps the previous tables).
 # MAGIC - `judge_config_id` fingerprints the scorers, the judge model and the verdict rules; `rescore_changed_config=true`
 # MAGIC   re-scores the turns judged with another configuration.
 # MAGIC - `feedback_to_agent_traces=true` also attaches the verdict to the assistant's own trace (needs CAN_EDIT on the
@@ -86,7 +87,7 @@ print({p: _installed(p) for p in NEEDED})
 dbutils.widgets.text("test_limit", "")                                            # e.g. "20"; empty = no cap
 dbutils.widgets.dropdown("dry_run", "false", ["true", "false"])                   # true = estimate only, nothing written
 dbutils.widgets.dropdown("rescore_changed_config", "false", ["true", "false"])    # true = re-score turns judged with another configuration
-dbutils.widgets.dropdown("reset_outputs", "false", ["true", "false"])             # true = drop the output tables before scoring
+dbutils.widgets.dropdown("reset_outputs", "false", ["true", "false"])             # true = score from scratch and replace the output tables
 dbutils.widgets.dropdown("feedback_to_agent_traces", "false", ["true", "false"])  # true = also attach the verdict to the assistant's trace
 dbutils.widgets.dropdown("fail_on_alert", "false", ["true", "false"])             # true = the run fails on a quality alert (job e-mail)
 dbutils.widgets.text("source_schema", "uat_landingzone.qualibot")                 # chat_messages / chat_feedbacks
@@ -145,7 +146,7 @@ print(f"dry_run={DRY_RUN} · rescore_changed_config={RESCORE_CHANGED} · reset_o
 
 # COMMAND ----------
 
-# DBTITLE 1,Connections — workspace, MLflow experiment, output reset
+# DBTITLE 1,Connections — workspace, MLflow experiment
 import os
 import time
 
@@ -161,12 +162,6 @@ import mlflow
 _parent = EXPERIMENT_PATH.rsplit("/", 1)[0]
 w.workspace.mkdirs(_parent if _parent.startswith("/Workspace") else f"/Workspace{_parent}")
 EXPERIMENT_ID = mlflow.set_experiment(EXPERIMENT_PATH).experiment_id
-
-# The output tables belong to the job identity: resetting them from the job avoids ownership issues
-if RESET_OUTPUTS and not DRY_RUN:
-    for table in (SCORES_TABLE, ASSESSMENTS_TABLE, SCORING_RUNS_TABLE):
-        spark.sql(f"DROP TABLE IF EXISTS {table}")
-    print(f"Output tables dropped: {SCORES_TABLE}, {ASSESSMENTS_TABLE}, {SCORING_RUNS_TABLE}")
 print(f"MLflow {mlflow.__version__} · experiment {EXPERIMENT_PATH} (id {EXPERIMENT_ID})")
 
 # COMMAND ----------
@@ -713,7 +708,7 @@ df_pairs = spark.sql(f"""
 
 # Turns already scored successfully are skipped; turns whose scoring failed (turn_verdict NULL) are retried.
 # With rescore_changed_config, turns scored under another judge configuration are scored again.
-if spark.catalog.tableExists(SCORES_TABLE):
+if spark.catalog.tableExists(SCORES_TABLE) and not RESET_OUTPUTS:
     scored = spark.table(SCORES_TABLE).filter(F.col("turn_verdict").isNotNull())
     if RESCORE_CHANGED:
         scored = scored.filter(F.col("judge_config_id") == JUDGE_CONFIG_ID)
@@ -1126,6 +1121,12 @@ def rate(series, value=True):
 
 run_row = None
 if len(df_final):
+    # reset_outputs: the tables are replaced only now, once the new scores exist (a failed run keeps the old ones).
+    # They belong to the job identity: resetting them from the job avoids ownership issues.
+    if RESET_OUTPUTS:
+        for table in (SCORES_TABLE, ASSESSMENTS_TABLE, SCORING_RUNS_TABLE):
+            spark.sql(f"DROP TABLE IF EXISTS {table}")
+        print(f"Output tables reset: {SCORES_TABLE}, {ASSESSMENTS_TABLE}, {SCORING_RUNS_TABLE}")
     ensure_table(SCORES_TABLE, SCORES_SCHEMA, "Qualibot production turns scored by LLM judges: one row per assistant "
                  "turn (labels, verdicts, rationales, references). Written by the quality scoring job.", SCORES_DOCS)
     ensure_table(ASSESSMENTS_TABLE, ASSESSMENTS_SCHEMA, "Qualibot production scoring: one row per assistant turn and "

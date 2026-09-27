@@ -10,6 +10,7 @@ import pandas as pd, mlflow
 from unittest.mock import MagicMock
 
 DRY = len(sys.argv) > 1 and sys.argv[1] == "dry"
+RESET = len(sys.argv) > 1 and sys.argv[1] == "reset"   # tables already exist: reset_outputs=true replaces them
 work = tempfile.mkdtemp(prefix="scoring_test_"); os.chdir(work)
 mlflow.set_tracking_uri(f"sqlite:///{work}/mlflow.db")
 
@@ -80,7 +81,12 @@ w.vector_search_indexes.query_index.side_effect = query_index
 import databricks.sdk
 databricks.sdk.WorkspaceClient = lambda: w
 
-ns = {"dbutils": types.SimpleNamespace(widgets=Widgets({"dry_run": "true" if DRY else "false", "experiment_path": "/Shared/qualibot-quality-scoring"}),
+if RESET:
+    for t in ["uat_proj.qualibot.chat_quality_scores", "uat_proj.qualibot.chat_quality_assessments",
+              "uat_proj.qualibot.chat_quality_scoring_runs"]:
+        sql.tables[t] = [{"message_id": i, "stale": True} for i in range(1, 5)]
+ns = {"dbutils": types.SimpleNamespace(widgets=Widgets({"dry_run": "true" if DRY else "false", "reset_outputs": "true" if RESET else "false",
+                                                         "experiment_path": "/Shared/qualibot-quality-scoring"}),
                                        library=MagicMock()),
       "spark": Spark(), "display": lambda *a, **k: print("[display]")}
 run_cells(str(REPO / "Score_Production_QA.py"), ns, skip=("Setup",))
@@ -89,6 +95,10 @@ if not DRY:
     df = ns["df_final"]
     print(df[["message_id", "turn_verdict", "failure_reasons", "groundedness_level", "missed_answer", "unverified_refs", "approximate_refs", "judge_errors"]].to_string())
     print("tables:", {t: len(r) for t, r in sql.tables.items()}, "| views:", sorted(sql.views))
+    if RESET:
+        assert all(len(r) == n and not any(x.get("stale") for x in r) for r, n in
+                   [(sql.tables["uat_proj.qualibot.chat_quality_scores"], 4), (sql.tables["uat_proj.qualibot.chat_quality_scoring_runs"], 1)])
+        print("reset: stale rows replaced")
     a = pd.DataFrame(sql.tables["uat_proj.qualibot.chat_quality_assessments"])
     print(a[a["message_id"] == 2][["assessment_name", "source_type", "value", "value_numeric"]].to_string())
     ddl = next(q for q in sql.statements if q.startswith("CREATE TABLE uat_proj.qualibot.chat_quality_scores"))
