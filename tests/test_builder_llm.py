@@ -50,3 +50,32 @@ assert by["c"].facts == ["THROTTLED C"] and calls.count("throttled c") == 2, "a 
 assert by["d"].relevance is None and "400" in by["d"].g_error and calls.count("broken d") == 1, "no retry on a client error"
 assert by["e"].g_error == "empty prompt"
 print("builder structured calls: ok")
+
+# What the assistant retrieved (trace returned with its answer) and the stage at fault of a failed case
+import json
+import math
+
+import numpy as np
+import pandas as pd
+
+refs_block = src[src.index("_EXT = re.compile"):src.index("def code_like")]
+ka_block = src[src.index("_SOURCE_HEADER = re.compile"):src.index("# COMMAND", src.index("_SOURCE_HEADER = re.compile"))]
+stage_block = re.search(r"def ka_failure_stage\(.*?\n    return .*?\n", src, re.S).group(0)
+ns2 = {"re": re, "json": json, "math": math, "pd": pd, "np": np, "LANG_SUFFIXES": ["FR", "GB", "BG"],
+       "KA_FAIL": {"incorrect", "partially_correct", "unjustified_refusal"}}
+exec(refs_block, ns2)
+exec(ka_block, ns2)
+exec(stage_block, ns2)
+docs = [{"page_content": "[Source: QP-1457 | Title: Records] kept 10 years", "metadata": {}},
+        {"page_content": "text", "metadata": {"doc_uri": "https://x/identification.aspx?ref=MI-1226_GB"}}]
+raw = {"output": [], "databricks_output": {"trace": {"data": {"spans": [
+    {"name": "docs", "attributes": {"mlflow.spanType": '"RETRIEVER"', "mlflow.spanOutputs": json.dumps(docs)}},
+    {"name": "llm", "attributes": {"mlflow.spanType": '"LLM"', "mlflow.spanOutputs": '"answer"'}}]}}}}
+assert ns2["ka_retrieval"](raw) == (["QP-1457", "MI-1226_GB"], 2), ns2["ka_retrieval"](raw)
+assert ns2["ka_retrieval"]({"output": []}) == (None, None)
+stage = ns2["ka_failure_stage"]
+assert stage("correct", ["QP-1457"], ["QP-1457"], 2) is None
+assert stage("incorrect", ["REF: QP-1457_FR"], ["QP-1457"], 2) == "generation"
+assert stage("incorrect", ["Q0258MM"], ["MI-1226_GB"], 2) == "retrieval"
+assert stage("unjustified_refusal", ["Q0258MM"], None, float("nan")) == "unknown"
+print("assistant retrieval and stage at fault of a failed case: ok")

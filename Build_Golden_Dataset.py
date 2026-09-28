@@ -12,7 +12,7 @@
 # MAGIC | 1 | Extract question/answer turns from the chat logs, with conversation history and user votes | – |
 # MAGIC | 2 | Annotate every question: intent, quality, test value, self-contained rewrite, feedback triage | 1 per question |
 # MAGIC | 3 | Build a diversified shortlist: embeddings + clustering + quotas, including production failures | embeddings |
-# MAGIC | 4 | Query the current assistant, and generate search queries (keywords, translation, title, hypothetical answer) | 1 per case |
+# MAGIC | 4 | Query the current assistant (answer and the passages it retrieved, from its trace), and generate search queries (keywords, translation, title, hypothetical answer) | 1 per case |
 # MAGIC | 5 | Pool evidence from many retrieval routes | – |
 # MAGIC | 6 | Grade every candidate chunk, expand around the most relevant ones (similar chunks of the same document, and the chunks just before and after in document order), grade the additions | 1 per chunk |
 # MAGIC | 7 | Generate two independent reference answers (A/B) from the relevant chunks | 2 per case |
@@ -121,14 +121,14 @@ DEDUP_SIM = 0.90                 # cosine above which two questions are duplicat
 CLUSTER_PENALTY = 1.5            # penalty when a topic cluster is already represented
 MAX_POOL_CHUNKS = 45             # candidate chunks graded per case (first pass)
 EXPANSION_PER_CHUNK = 4          # chunks fetched around each highly relevant chunk (second pass)
-MAX_CONTEXT_CHUNKS = 16          # relevant chunks given to the reference generators
 EXCLUDED_INTENTS = {"chitchat_or_meta", "link_or_navigation"}
 LANG_SUFFIXES = ["FR", "GB", "EN", "UK", "CZ", "ES", "DE", "PT", "IT", "MX", "BG", "RO", "PL", "TN"]
 NEIGHBOUR_WINDOW = 1             # chunks taken before and after each directly relevant chunk (document order)
 
 # Shortlist quotas for log questions (predicates in section 3)
 SLOT_QUOTAS = {
-    "production_failure": 8, "negative_feedback": 5, "suspect_answer": 4, "multi_doc_or_hard": 4,
+    "production_retrieval_miss": 3, "production_compliance_claim": 3, "production_failure": 4,
+    "negative_feedback": 5, "suspect_answer": 4, "multi_doc_or_hard": 4,
     "requirement_compliance": 4, "document_lookup": 5, "procedure": 4, "rule_requirement": 4,
     "definition_acronym": 3, "multi_turn": 3, "out_of_scope": 2, "other_language": 1,
 }
@@ -640,13 +640,46 @@ def extract_text(resp) -> str:
 
 
 def ask_ka(messages) -> dict:
+    """Response of the assistant, with its trace when the endpoint returns it (databricks_options.return_trace)."""
     last_error = None
-    for body in ({"input": messages}, {"messages": messages}):
+    for body in ({"input": messages, "databricks_options": {"return_trace": True}}, {"input": messages},
+                 {"messages": messages}):
         try:
             return w.api_client.do("POST", f"/serving-endpoints/{KA_ENDPOINT}/invocations", body=body)
         except Exception as e:
             last_error = e
     raise last_error
+
+
+_SOURCE_HEADER = re.compile(r"\[Source:\s*([^|\]\n]+)")
+
+
+def ka_retrieval(raw) -> tuple:
+    """(document codes, number of passages) retrieved by the assistant: RETRIEVER steps of the trace it returned;
+    (None, None) without a trace."""
+    trace = (raw.get("databricks_output") or {}).get("trace") if isinstance(raw, dict) else None
+    if not isinstance(trace, dict):
+        return None, None
+    refs, n = [], 0
+    for span in (trace.get("data") or {}).get("spans") or []:
+        attributes = span.get("attributes") or {}
+        if "RETRIEVER" not in str(span.get("span_type") or attributes.get("mlflow.spanType") or "").upper():
+            continue
+        out = span.get("outputs", attributes.get("mlflow.spanOutputs"))
+        if isinstance(out, str):
+            try:
+                out = json.loads(out)
+            except json.JSONDecodeError:
+                out = []
+        for doc in (d for d in (out if isinstance(out, list) else []) if isinstance(d, dict)):
+            n += 1
+            meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
+            header = _SOURCE_HEADER.search(str(doc.get("page_content") or ""))
+            in_uri = _REF_IN_URL.search(str(meta.get("doc_uri") or ""))
+            ref = meta.get("REF") or (header.group(1).strip() if header else None) or (in_uri.group(1) if in_uri else None)
+            if ref:
+                refs.append(str(ref))
+    return list(dict.fromkeys(refs)), n
 
 # COMMAND ----------
 
@@ -675,7 +708,7 @@ def build_qa():
           .withColumn("retrieved_context", F.lead("sources_json").over(w_s))
           .withColumn("answer_status", F.lead("status").over(w_s))
           .withColumn("history", F.collect_list(F.struct(
-              F.col("role").alias("role"), F.substring("content", 1, 1500).alias("content"))).over(w_h))
+              F.col("role").alias("role"), F.col("content").alias("content"))).over(w_h))
           .filter((F.col("role") == "user") & (F.col("next_role") == "assistant")))
 
     fb = (spark.table(f"{SRC}.chat_feedbacks").groupBy("message_id")
@@ -760,7 +793,7 @@ def prompt_annotations(d):
         PROMPT_ANNOTATE,
         "\n\n### History\n", F.coalesce(F.nullif(F.col("history_text"), F.lit("")), F.lit("(none)")),
         "\n\n### Question\n", F.col("question"),
-        "\n\n### Qualibot answer\n", F.coalesce(F.substring("actual_response", 1, 2000), F.lit("(none: synthetic question)")),
+        "\n\n### Qualibot answer\n", F.coalesce(F.col("actual_response"), F.lit("(none: synthetic question)")),
         "\n\n### Sources returned by Qualibot\n", F.when(F.col("has_sources"), "yes").otherwise("no"),
         "\n\n### User feedback\n", F.concat_ws(" — ", F.coalesce(F.col("vote"), F.lit("none")), F.col("comment"))))
 
@@ -793,13 +826,23 @@ pdf = (df_ann.join(df_emb.select("question_id", "emb"), "question_id")
 E = np.vstack(pdf["emb"].apply(lambda v: np.asarray(v, dtype=np.float32)).values)
 E /= np.linalg.norm(E, axis=1, keepdims=True) + 1e-9
 
-# Turns judged bad (or voted down) by the production quality scoring: the most valuable test cases
+# Turns judged bad (or voted down) by the production quality scoring: the most valuable test cases. The stage at fault
+# (retrieval or generation) and unsupported compliance claims come from the same scoring.
 try:
-    prod_bad = {str(r.message_id) for r in spark.table(PROD_SCORES_TABLE).filter("golden_candidate").select("message_id").collect()}
+    _scores = spark.table(PROD_SCORES_TABLE)
+    _extra = [c for c in ("error_source", "compliance_claim") if c in _scores.columns]
+    prod_bad = {str(r["message_id"]): r.asDict() for r in _scores.filter("golden_candidate")
+                                                             .select("message_id", *_extra).collect()}
 except Exception:
-    prod_bad = set()
-pdf["production_failure"] = pdf["answer_id"].map(lambda a: str(a) in prod_bad if pd.notna(a) else False)
-print(f"{len(prod_bad)} production failure(s) available, {int(pdf['production_failure'].sum())} among the annotated turns")
+    prod_bad = {}
+_prod = lambda a: prod_bad.get(str(a)) if pd.notna(a) else None
+pdf["production_failure"] = pdf["answer_id"].map(lambda a: _prod(a) is not None)
+pdf["production_error_source"] = pdf["answer_id"].map(lambda a: (_prod(a) or {}).get("error_source"))
+pdf["production_compliance_claim"] = pdf["answer_id"].map(
+    lambda a: (_prod(a) or {}).get("compliance_claim") == "unsupported_compliance_claim")
+print(f"{len(prod_bad)} production failure(s) available, {int(pdf['production_failure'].sum())} among the annotated turns "
+      f"(retrieval at fault: {int(pdf['production_error_source'].isin(['retrieval', 'retrieval_and_generation']).sum())}, "
+      f"unsupported compliance claims: {int(pdf['production_compliance_claim'].sum())})")
 
 is_log = (pdf["source"] == "log").values
 km = KMeans(n_clusters=min(N_CLUSTERS, max(2, is_log.sum() // 5)), n_init=10, random_state=42)
@@ -827,6 +870,8 @@ def case_score(r):
 pdf["score"] = pdf.apply(case_score, axis=1)
 
 SLOT_PREDICATES = {
+    "production_retrieval_miss": lambda r: r.production_error_source in ("retrieval", "retrieval_and_generation"),
+    "production_compliance_claim": lambda r: bool(r.production_compliance_claim),
     "production_failure": lambda r: bool(r.production_failure),
     "negative_feedback":  lambda r: r.vote == "down" and r.feedback_triage in ("legitimate", "ambiguous"),
     "suspect_answer":     lambda r: r.ka_answer_assessment in ("wrong_or_hallucinated", "partial", "refusal"),
@@ -878,10 +923,11 @@ for slot, quota in SLOT_QUOTAS.items():
 override_ids = {o["question_id"] for o in MANUAL_OVERRIDES}
 sel_rows = [(int(pdf.at[i, "question_id"]),
              "synthetic" if pdf.at[i, "question_id"] < 0 else ("override" if pdf.at[i, "question_id"] in override_ids else "log"),
-             slot_of[i], float(pdf.at[i, "score"]), int(pdf.at[i, "cluster"]), bool(pdf.at[i, "production_failure"]))
+             slot_of[i], float(pdf.at[i, "score"]), int(pdf.at[i, "cluster"]), bool(pdf.at[i, "production_failure"]),
+             pdf.at[i, "production_error_source"] if pd.notna(pdf.at[i, "production_error_source"]) else None)
             for i in chosen]
 df_sel = spark.createDataFrame(sel_rows, "question_id long, source string, slot string, score double, cluster int, "
-                                         "production_failure boolean")
+                                         "production_failure boolean, production_error_source string")
 df_hints = spark.createDataFrame([(int(o["question_id"]), o.get("expected_response"), o.get("expected_sources"))
                                   for o in MANUAL_OVERRIDES + SYNTHETIC_QUERIES],
                                  "question_id long, hint_response string, hint_sources string")
@@ -904,24 +950,32 @@ def compute_ka(rows):
         for fut in as_completed(futures):
             try:
                 raw = fut.result()
-                out.append((futures[fut], extract_text(raw), refs_in_response(raw), None))
+                retrieved, n_passages = ka_retrieval(raw)
+                raw = {k: v for k, v in raw.items() if k != "databricks_output"} if isinstance(raw, dict) else raw
+                out.append((futures[fut], extract_text(raw), refs_in_response(raw), None, retrieved, n_passages))
             except Exception as e:
-                out.append((futures[fut], None, [], str(e)[:500]))
+                out.append((futures[fut], None, [], str(e)[:500], None, None))
     return out
 
 
-KA_SCHEMA = "question_id long, ka_fresh_response string, ka_fresh_refs array<string>, ka_fresh_error string"
+KA_SCHEMA = ("question_id long, ka_fresh_response string, ka_fresh_refs array<string>, ka_fresh_error string, "
+             "ka_fresh_retrieved_refs array<string>, ka_fresh_retrieved_count int")
 if QUERY_KA_FRESH:
     df_ka = incremental_py("ka_fresh", df_short.select("question_id", "question", "history", "is_self_contained"),
                            compute_ka, KA_SCHEMA, ok_col="ka_fresh_response")
-    display(df_ka.groupBy(F.col("ka_fresh_response").isNotNull().alias("answered")).count())
+    display(df_ka.groupBy(F.col("ka_fresh_response").isNotNull().alias("answered"),
+                          F.col("ka_fresh_retrieved_count").isNotNull().alias("retrieval_known")).count())
 
 
 def get_ka():
     k = load_stage("ka_fresh")
     if k is None:
         return spark.createDataFrame([], KA_SCHEMA)
-    return k if "ka_fresh_refs" in k.columns else k.withColumn("ka_fresh_refs", F.array().cast("array<string>"))
+    for column, kind in [("ka_fresh_refs", "array<string>"), ("ka_fresh_retrieved_refs", "array<string>"),
+                         ("ka_fresh_retrieved_count", "int")]:
+        if column not in k.columns:
+            k = k.withColumn(column, F.lit(None).cast(kind))
+    return k
 
 # COMMAND ----------
 
@@ -941,8 +995,8 @@ def build_reform(d):
     d = d.withColumn("_p", P(PROMPT_REFORM,
                              "\n\n### Question\n", F.col("standalone_question"),
                              "\n\n### History\n", F.col("history_text"),
-                             "\n\n### Qualibot answer (logs)\n", F.substring("actual_response", 1, 2000),
-                             "\n\n### Qualibot answer (current)\n", F.substring("ka_fresh_response", 1, 2000)))
+                             "\n\n### Qualibot answer (logs)\n", F.col("actual_response"),
+                             "\n\n### Qualibot answer (current)\n", F.col("ka_fresh_response")))
     props = {"search_queries": s_arr(s_str()), "hypothetical_answer": s_str(), "mentioned_refs": s_arr(s_str())}
     return llm(d, "_p", "rf", props).select("question_id", "rf.search_queries", "rf.hypothetical_answer",
                                             "rf.mentioned_refs", "rf_error", *usage("rf"))
@@ -988,6 +1042,7 @@ def _pool_one(r) -> list:
         "hint": resolve_refs(r.hint_sources),
         "assistant_logs": resolve_refs(refs_in_sources_json(r.retrieved_context)),
         "assistant_current": resolve_refs(list(r.ka_fresh_refs or [])),
+        "assistant_retrieval": resolve_refs(list(r.ka_fresh_retrieved_refs or [])),
         "mentioned": resolve_refs(list(r.mentioned_refs or []) + sorted(code_like(r.actual_response))
                                   + sorted(code_like(r.ka_fresh_response))),
     }
@@ -1000,7 +1055,7 @@ def _pool_one(r) -> list:
         if not resolve_refs([c]):
             _ref_warnings[c.strip()] += 1
 
-    priority = {"hint", "assistant_logs", "assistant_current", "mentioned"}
+    priority = {"hint", "assistant_logs", "assistant_current", "assistant_retrieval", "mentioned"}
     items = sorted(chunks.items(), key=lambda kv: (bool(kv[1]["origins"] & priority), len(kv[1]["origins"]),
                                                    kv[1]["best_score"]), reverse=True)[:MAX_POOL_CHUNKS]
     return [(int(r.question_id), cid, c["REF"], c["semantic_headers"], c["chunk_text"], sorted(c["origins"]),
@@ -1024,7 +1079,8 @@ df_pool_in = (df_short
                     if "hypothetical_answer" in load_stage("reformulations").columns
                     else load_stage("reformulations").select("question_id", "search_queries", "mentioned_refs")
                          .withColumn("hypothetical_answer", F.lit(None).cast("string")), "question_id", "left")
-              .join(get_ka().select("question_id", "ka_fresh_response", "ka_fresh_refs"), "question_id", "left"))
+              .join(get_ka().select("question_id", "ka_fresh_response", "ka_fresh_refs", "ka_fresh_retrieved_refs"),
+                    "question_id", "left"))
 df_pool = incremental_py("evidence_pool", df_pool_in, compute_pool, POOL_SCHEMA)
 display(df_pool.groupBy("question_id").agg(F.count("*").alias("chunks"), F.countDistinct("REF").alias("documents")).summary())
 
@@ -1145,12 +1201,13 @@ def evidence_df():
          .withColumn("_txt", P("[REF: ", F.col("REF"), " | ", F.substring("semantic_headers", 1, 150),
                                " | relevance ", F.col("relevance"), "]\n", F.col("chunk_text"))))
     agg = (j.filter(F.col("relevance") >= 2).groupBy("question_id").agg(
-        F.slice(F.sort_array(F.collect_list(F.struct("relevance", "best_score", "_txt")), asc=False), 1, MAX_CONTEXT_CHUNKS).alias("_top"),
+        F.sort_array(F.collect_list(F.struct("relevance", "best_score", "_txt")), asc=False).alias("_top"),
         F.array_distinct(F.collect_list(F.when(F.col("relevance") == 3, F.col("REF")))).alias("refs_rel3"),
         F.array_distinct(F.collect_list(F.when(F.col("relevance") == 2, F.col("REF")))).alias("refs_rel2"),
         F.max(((F.col("relevance") == 3) & F.array_contains("origins", "question")).cast("int")).alias("found_by_question_query"),
         F.max(((F.col("relevance") == 3) & (F.array_contains("origins", "assistant_logs")
-                                            | F.array_contains("origins", "assistant_current"))).cast("int")).alias("assistant_retrieved_relevant"),
+                                            | F.array_contains("origins", "assistant_current")
+                                            | F.array_contains("origins", "assistant_retrieval"))).cast("int")).alias("assistant_retrieved_relevant"),
         F.max(((F.col("relevance") == 3) & F.array_contains("origins", "expansion")).cast("int")).alias("found_by_expansion"),
         F.max(((F.col("relevance") == 3) & F.array_contains("origins", "neighbour")).cast("int")).alias("found_by_neighbour"),
         F.count("*").alias("n_relevant_chunks"))
@@ -1186,7 +1243,11 @@ Fields:
   missing and give what is partially available. Out of scope: politely explain that Qualibot only covers the quality
   documentation.
 - expected_sources: REF codes of the documents that are indispensable to the answer.
-- missing_information: what is missing or ambiguous (empty if nothing)."""
+- missing_information: what is missing or ambiguous (empty if nothing).
+
+Compliance questions (does the company meet a customer or standard requirement, which document proves it): the expected
+answer names the internal documents that address the requirement and states what they establish; it concludes on
+compliance only as far as they establish it, and says explicitly what the excerpts do not demonstrate."""
 
 GEN_PROPS = {
     "analysis": s_str(),
@@ -1234,7 +1295,8 @@ Build the final reference:
 - expected_sources: indispensable REF codes.
 - answerability: full, partial, none or out_of_scope.
 - guidelines: 1 to 3 behavioural guidelines a judge can check, only when they matter for this case (e.g. « Must cite
-  PRLAT508 », « Must say the information is not in the documentation instead of inventing it »).
+  PRLAT508 », « Must say the information is not in the documentation instead of inventing it »). For a compliance
+  question, the reference concludes on compliance only as far as the excerpts establish it.
 - ka_log_verdict and ka_fresh_verdict: correct, partially_correct, incorrect, justified_refusal, unjustified_refusal,
   not_available (no answer).
 - disagreements: A/B disagreements, contradictions between the hint and the excerpts, or between Qualibot and the excerpts.
@@ -1267,8 +1329,8 @@ def build_arb(d):
         "\n\n### Excerpts\n", F.col("context"),
         "\n\n### Reference A\n", F.to_json("gen_a"),
         "\n\n### Reference B\n", F.to_json("gen_b"),
-        "\n\n### Qualibot answer (logs)\n", F.coalesce(F.substring("actual_response", 1, 3000), F.lit("(none)")),
-        "\n\n### Qualibot answer (current)\n", F.coalesce(F.substring("ka_fresh_response", 1, 3000), F.lit("(none)"))))
+        "\n\n### Qualibot answer (logs)\n", F.coalesce(F.col("actual_response"), F.lit("(none)")),
+        "\n\n### Qualibot answer (current)\n", F.coalesce(F.col("ka_fresh_response"), F.lit("(none)"))))
     return llm(d, "_p", "arb", ARB_PROPS).select("question_id", "arb", "arb_error", *usage("arb"))
 
 
@@ -1325,8 +1387,22 @@ pdf_all = (load_stage("shortlist")
            .join(load_stage("gold_candidates"), "question_id", "left")
            .join(load_stage("gold_arbitrated"), "question_id", "left")
            .join(load_stage("gold_verified"), "question_id", "left")
-           .join(get_ka().select("question_id", "ka_fresh_response"), "question_id", "left")
+           .join(get_ka().select("question_id", "ka_fresh_response", "ka_fresh_retrieved_refs", "ka_fresh_retrieved_count"),
+                 "question_id", "left")
            .toPandas())
+
+
+def ka_failure_stage(verdict, expected_sources, retrieved, n_passages):
+    """Stage at fault when the current assistant fails the case: retrieval (none of the expected documents among the
+    passages it retrieved), generation (it retrieved at least one of them, or no document is expected), unknown (its
+    trace was not returned); None when it does not fail."""
+    if verdict not in KA_FAIL:
+        return None
+    if n_passages is None or pd.isna(n_passages):
+        return "unknown"
+    expected = {base_ref(re.sub(r"^\s*REF\s*:\s*", "", str(d))) for d in expected_sources}
+    got = {base_ref(d) for d in (retrieved if retrieved is not None else [])}
+    return "generation" if not expected or expected & got else "retrieval"
 
 
 def _g(obj, attr, default=None):
@@ -1359,7 +1435,9 @@ def consolidate(r):
     if _g(r.gen_a, "answerability") != _g(r.gen_b, "answerability"):
         conf -= 1
     fresh = _g(arb, "ka_fresh_verdict", "not_available")
-    notes = [f"Confidence: {_g(arb, 'confidence_reasons', '')}", f"Disagreements: {_g(arb, 'disagreements', '')}",
+    retrieved = list(r.ka_fresh_retrieved_refs) if isinstance(r.ka_fresh_retrieved_refs, (list, np.ndarray)) else None
+    notes = [f"Confidence: {_g(arb, 'confidence_reasons', '')}",
+             f"Assistant retrieved: {', '.join(retrieved) if retrieved else ''}", f"Disagreements: {_g(arb, 'disagreements', '')}",
              f"Missing (A): {_g(r.gen_a, 'missing_information', '')}",
              f"Unsupported in the reference answer: {'; '.join(_g(ver, 'response_unsupported_claims', []))}",
              f"Rejected facts: {'; '.join(f['fact'] for f in rejected)}", f"Annotation: {r.analysis or ''}"]
@@ -1371,6 +1449,8 @@ def consolidate(r):
         "guidelines": list(dict.fromkeys(cur.get("human_guidelines", []) + list(_g(arb, "guidelines", [])))),
         "ka_log_verdict": _g(arb, "ka_log_verdict"), "ka_fresh_verdict": fresh,
         "ka_verdict": fresh if fresh != "not_available" else _g(arb, "ka_log_verdict", "not_available"),
+        "ka_failure_stage": ka_failure_stage(fresh, list(_g(arb, "expected_sources", [])), retrieved,
+                                             r.ka_fresh_retrieved_count),
         "confidence_arbiter": _g(arb, "confidence"), "confidence_final": max(conf, 0),
         "notes": " | ".join(x for x in notes if not x.rstrip().endswith(":")),
     })
@@ -1405,7 +1485,9 @@ def select_final(pdf):
     fill(ok[ok["final_answerability"].isin(["none", "out_of_scope"])],
          MIN_REFUSAL_CASES - count(lambda r: r.final_answerability in ("none", "out_of_scope")))
     fill(ok[ok["ka_verdict"] == "correct"], MIN_KA_OK - count(lambda r: r.ka_verdict == "correct"))
-    fill(pdf[(pdf["confidence_final"] < 2) & pdf["slot"].isin(["negative_feedback", "production_failure"])], MAX_NEEDS_EXPERT)
+    fill(pdf[(pdf["confidence_final"] < 2) & pdf["slot"].isin(["negative_feedback", "production_failure",
+                                                                "production_retrieval_miss", "production_compliance_claim"])],
+         MAX_NEEDS_EXPERT)
     fill(ok, TARGET_N)
     out = pdf[pdf["question_id"].isin(chosen)].copy()
     out["needs_expert"] = out["confidence_final"] < 2
@@ -1428,7 +1510,8 @@ GOLDEN_SCHEMA = T.StructType([T.StructField(n, t) for n, t in [
     ("n_pool_chunks", T.DoubleType()), ("n_relevant_chunks", T.DoubleType()), ("notes", T.StringType()),
     ("context", T.StringType()), ("essential_facts_json", T.StringType()), ("secondary_facts_json", T.StringType()),
     ("rejected_facts_json", T.StringType()), ("expected_sources_json", T.StringType()), ("guidelines_json", T.StringType()),
-    ("messages_json", T.StringType())]])
+    ("messages_json", T.StringType()), ("production_error_source", T.StringType()),
+    ("ka_failure_stage", T.StringType())]])
 
 
 def _py(v, t):
@@ -1683,6 +1766,8 @@ from mlflow.entities.trace_location import UnityCatalog
 REQUIRE_VALIDATION = False      # True = only cases marked "validated" in section 11
 RECREATE_DATASET = True         # True = rebuild the dataset from scratch (records are otherwise only added/updated)
 LANG_GUIDELINE = "Answers in the language of the user's last question."
+COMPLIANCE_GUIDELINE = ("Cites the internal documents that address the requirement and says what they state; does not "
+                        "assert that the company complies beyond what those documents establish.")
 
 # Case corrections from the analysis of evaluation runs (key = unique excerpt of the conversation)
 CASE_FIXES = [
@@ -1736,6 +1821,8 @@ def to_record(r):
     # The correctness judge accepts expected_facts OR expected_response, never both
     exp = {"expected_facts": facts} if facts else {"expected_response": fix.get("expected_response", r.expected_response)}
     exp["guidelines"] = [LANG_GUIDELINE, *CURATED.get(int(r.question_id), {}).get("human_guidelines", [])]
+    if r.intent == "requirement_compliance":
+        exp["guidelines"].append(COMPLIANCE_GUIDELINE)
     sources = [clean_ref(s) for s in fix.get("sources", r.expected_sources)]
     if sources:
         exp["expected_retrieved_context"] = [{"doc_uri": s} for s in sources]
@@ -1791,6 +1878,9 @@ GOLDEN_CASES_COLUMNS = [
     ("confidence_final", T.LongType(), "Confidence in the reference answer, 0 to 3"),
     ("dataset_name", T.StringType(), "MLflow evaluation dataset"),
     ("exported_at", T.StringType(), "Export time (UTC)"),
+    ("ka_failure_stage", T.StringType(), "When the current assistant fails the case: retrieval (it retrieved none of the "
+                                         "expected documents), generation (it retrieved them) or unknown; NULL otherwise"),
+    ("production_error_source", T.StringType(), "Stage at fault found by the production scoring, for production failures"),
 ]
 GOLDEN_CASES_SCHEMA = T.StructType([T.StructField(n, t) for n, t, _ in GOLDEN_CASES_COLUMNS])
 exported_ids = set(kept["question_id"])
@@ -1807,13 +1897,19 @@ for _, r in pdf_final.iterrows():
         status(qid), decisions.get(qid, ("", ""))[1] or None, r.source, r.slot, r.intent, r.difficulty, r.language,
         r.question, r.final_answerability, "\n".join(facts) or rec.get("expected_response", r.expected_response),
         len(facts), [clean_ref(d["doc_uri"]) for d in rec.get("expected_retrieved_context", [])] or list(r.expected_sources),
-        list(rec.get("guidelines", r.guidelines)), r.ka_verdict, int(r.confidence_final), EVAL_DATASET_UC, exported_at))
+        list(rec.get("guidelines", r.guidelines)), r.ka_verdict, int(r.confidence_final), EVAL_DATASET_UC, exported_at,
+        *[None if pd.isna(v) else v for v in (r.ka_failure_stage, r.production_error_source)]))
 esc = lambda t: str(t).replace("'", "\\'")
 if not spark.catalog.tableExists(GOLDEN_CASES_TABLE):
     spark.sql(f"CREATE TABLE {GOLDEN_CASES_TABLE} (" + ", ".join(
         f"`{n}` {t.simpleString().upper()} COMMENT '{esc(d)}'" for n, t, d in GOLDEN_CASES_COLUMNS)
         + ") COMMENT 'Qualibot golden evaluation cases, one row per reviewed case: composition and review status of the "
           "golden dataset.'")
+else:
+    _missing = [c for c in GOLDEN_CASES_COLUMNS if c[0] not in spark.table(GOLDEN_CASES_TABLE).columns]
+    if _missing:
+        spark.sql(f"ALTER TABLE {GOLDEN_CASES_TABLE} ADD COLUMNS (" + ", ".join(
+            f"`{n}` {t.simpleString().upper()} COMMENT '{esc(d)}'" for n, t, d in _missing) + ")")
 spark.createDataFrame(case_rows, GOLDEN_CASES_SCHEMA).createOrReplaceTempView("_golden_cases")
 spark.sql(f"INSERT OVERWRITE {GOLDEN_CASES_TABLE} SELECT * FROM _golden_cases")
 print(f"✓ {GOLDEN_CASES_TABLE}: {len(case_rows)} reviewed cases, {len(exported_ids)} exported")
