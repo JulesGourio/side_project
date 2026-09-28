@@ -38,12 +38,24 @@
 - The retrieval judges `groundedness` and `missed_answer` read the excerpts of the cited documents from the trace's
   `RETRIEVER` step (`cited_document_excerpts`) and return no assessment when there is none. The excerpts are a subset of
   the documents: a claim absent from them is "not verifiable", not "not supported".
+- Never cap what the judges read (user requirement): every document the answer relies on, untruncated chunks, the whole
+  conversation window the assistant saw. `evidence_queries` (shared cell) searches each document with the question,
+  each answer line citing it (`⟦n⟧` marker = `n` of `sources_json`, footnote, or code in the line) and each passage the
+  assistant quoted from it (`#:~:text=` fragment, footnote text); `EXCERPTS_PER_QUERY` chunks per search, deduplicated
+  (README, "Evidence read by the retrieval judges"). The chunks are re-retrieved from `chunks_index_v1`, not the
+  passages the assistant read.
 - Judges are skipped when not applicable: `user_reaction` only when the user wrote again (otherwise `no_next_turn`,
   free), retrieval judges only when the answer cites indexed documents, `safety` on a stable 10% sample of the turns;
   `answer_type` also carries the completeness (`answered_full` / `answered_partial`). Scorers are registered again only when their
   fingerprint changes (experiment tag `qualibot.scorers_config_id`).
-- Dashboard data: documented Unity Catalog tables and views in `uat_proj.qualibot` (catalogue in `README.md`,
-  "Dashboard data"); rows are replaced by key (`message_id` in production, `run_id` in evaluation).
+- Dashboard data: documented Unity Catalog tables in `uat_proj.qualibot`, no view (user decision; catalogue in
+  `README.md`, "Dashboard data"); rows are replaced by key (`message_id` in production, `run_id` in evaluation);
+  evaluation rows carry their run context (start time, subset, scorer configuration) so no join is needed.
+- Judge pacing: 70% (`JUDGE_RATE_SHARE`) of the judge model's limits (200k input / 20k output tokens per minute; the
+  output limit binds, about 25 calls per minute). Production scores batches of about one minute of that budget, writes
+  each batch, stops starting batches after `max_run_minutes` (turns left go to the next run) and slows down after a
+  rate-limit error; evaluation sets `MLFLOW_GENAI_EVAL_SCORER_RATE_LIMIT`. `MLFLOW_GENAI_EVAL_MAX_RETRIES=7` in both
+  (MLflow's own 429 backoff: 1 s … 60 s). Each production batch logs one `dataset` input to the run (MLflow behaviour).
 - Production monitoring replays the stored answers through `mlflow.genai.evaluate` (`replay_turn`), so each scored turn
   is a trace with its conversation, answer, excerpts, every verdict, the rule-based `turn_verdict` and the user's vote.
 - Evaluation runs on the full golden dataset are linked to it by `evaluate`; sampled runs are linked with `log_input`.
@@ -54,7 +66,9 @@
 - Outputs: `uat_proj.qualibot` (scores, scoring runs, trace tables `trace_*`).
 - Assistants: ALL `ka-7679a56e-endpoint` (the one evaluated), IS `ka-1560aded-endpoint`, AS `ka-3a7e9255-endpoint`
   (IS and AS are subsets of ALL by department). Max 3 concurrent calls per endpoint.
-- Judge model: `databricks-gpt-5-6-luna` (2.857 DBU/M input tokens, 17.143 DBU/M output tokens).
+- Judge model: `databricks-gpt-5-6-luna`; limits 200k input and 20k output tokens per minute, 1,000 requests per second,
+  360k per hour. Its price has dropped: the notebooks still hold 2.857 DBU/M input and 17.143 DBU/M output tokens
+  until the user gives the new price.
 - SQL warehouse for Unity Catalog traces: `5890912c31867b77`.
 - Job identity (UAT): service principal `3e5cd4e5-f765-4760-b974-ee7715258b39`; it owns the output tables.
 
@@ -85,8 +99,7 @@
 - Trace tags hold short identifiers only: on Databricks a tag value over ~250 characters makes the whole trace fail
   (turn not scored). Variable-length data (document lists, next user message, errors) goes to the trace step
   `answer_context` (`record_answer_context`), which the scorers read.
-- `cited_document_excerpts` (shared cell) retrieves up to 3 excerpts for each of the first 6 cited documents, so that
-  every checked document is represented; `relevance` and `answer_type` must not judge language, facts or evidence.
+- `relevance` and `answer_type` must not judge language, facts or evidence.
 - Reading traces stored in Unity Catalog requires `MLFLOW_TRACING_SQL_WAREHOUSE_ID`.
 - An MLflow experiment's parent folder must exist (`w.workspace.mkdirs`).
 - Document codes: compare with a key insensitive to language suffix (`_FR`, `.FR`, `_GB`, `_BG`…), separators, case
@@ -110,8 +123,8 @@
 | Component | State |
 |---|---|
 | Trace migration (`D_2_qualibot-traces-sync`) | Deployed in UAT. Manual runs: `trace_test`, then `trace_ka_all_v2`, then `trace_ka_is_v2,trace_ka_as_v2`. Schedule to unpause with `to_migrate: "*"` once validated. |
-| Production scoring (`D_3_qualibot-quality-scoring`) | Registered MLflow scorers (about 6 judge calls per turn), tables `chat_quality_*` and 5 views; failure e-mail configured, quality alerts e-mailed only once `fail_on_alert` is "true" ("false" for now); tested end to end locally, not yet run in Databricks. Test run on 20 turns done in UAT; `reset_outputs=true` replaces the tables only once the new scores are written. Three 20-turn runs reviewed with the user; the third one is validated (20/20 scored, no scorer error, every bad verdict traced to a real assistant error). Next: score the backlog (`test_limit=300` per run, about 5 runs), then unpause the schedule. |
-| Evaluation notebook | Shared scorers with monitoring, every scorer registered, dataset linked to every run, tables `ka_eval_*` and 3 views; tested end to end locally, not yet run in Databricks. |
+| Production scoring (`D_3_qualibot-quality-scoring`) | Registered MLflow scorers (about 6 judge calls per turn), tables `chat_quality_*` (no view); failure e-mail configured, quality alerts e-mailed only once `fail_on_alert` is "true" ("false" for now); tested end to end locally, not yet run in Databricks. Test run on 20 turns done in UAT; `reset_outputs=true` replaces the tables only once the new scores are written. Three 20-turn runs reviewed with the user; the third one is validated (20/20 scored, no scorer error, every bad verdict traced to a real assistant error). Evidence now uncapped and targeted on the citing lines, batches paced on the judge limits (about 3 turns per minute) and written one by one, time budget `max_run_minutes`: tested locally only. Next: re-run 20 turns (`reset_outputs=true`, `test_limit=20`) to check the new evidence, then score the backlog (runs of `max_run_minutes=100`, about 5 runs), then unpause the schedule. |
+| Evaluation notebook | Shared scorers with monitoring, every scorer registered, dataset linked to every run, tables `ka_eval_*` (no view); tested end to end locally, not yet run in Databricks. |
 | Golden dataset builder | 20-30 cases, compliance-matrix quota, neighbour expansion by `chunk_index`, flat table `ka_eval_golden_cases`; reuses the existing cache; not yet run in Databricks. |
 
 ### Findings from the first evaluation run (25 cases, qualibot_ALL_v2)
@@ -142,14 +155,17 @@
 - Is there a document metadata table (title, language, status current/obsolete), e.g. from the parsing pipeline? Titles
   are otherwise only in the `chunk_text` header of `chunks_v1`.
 - Do the assistants' trace spans hold the retrieved chunk texts? The trace output only carries the cited passages
-  (`#:~:text=` fragments); if spans hold more, the evaluation can measure the assistant's actual retrieval.
+  (`#:~:text=` fragments); if spans hold more, the judges can read exactly what the assistant read, and the evaluation
+  can measure the assistant's actual retrieval.
+- New price of the judge model (DBU per million input and output tokens), and the real mean input and output tokens per
+  judge call (`system.serving.endpoint_usage`, requester = the job's service principal) to calibrate the pacing.
 - Errors of the D_2 and D_3 runs (the user will send them).
 - Knowledge Assistant experiments may offer a native "Delta sync" trace archival option; if available, it could replace
   the nightly migration job for new traces.
 
 ### Next tasks, in priority order
 1. Run the production scoring (see Delivered) and check the Traces, Judges and Runs tabs of
-   `/Shared/qualibot-quality-scoring` and the tables and views of `uat_proj.qualibot`; build the dashboard on the views
+   `/Shared/qualibot-quality-scoring` and the tables of `uat_proj.qualibot`; build the dashboard on the tables
    (`README.md`, "Dashboard data").
 2. Run `Build_Golden_Dataset.py` with `FORCE = {"reformulations", "evidence_pool", "ka_fresh"}` to benefit from the
    retrieval routes (hypothetical answer, current assistant sources, similar and adjacent chunks), review in section 11,

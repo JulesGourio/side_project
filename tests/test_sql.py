@@ -1,6 +1,6 @@
 """Replays on a real local Spark session the SQL written by the notebooks in tests/test_scoring.py and
-tests/test_eval.py (run with SQL_DUMP=<file>): table DDL with comments, inserted rows, dashboard views, then queries
-every view. Delta-only statements (MERGE) are skipped. Needs pyspark and Java.
+tests/test_eval.py (run with SQL_DUMP=<file>): table DDL with comments and inserted rows, then typical dashboard
+queries on the tables. Delta-only statements (MERGE) are skipped. Needs pyspark and Java.
 
     SQL_DUMP=/tmp/scoring.json python tests/test_scoring.py && SQL_DUMP=/tmp/eval.json python tests/test_eval.py ""
     python tests/test_sql.py /tmp/scoring.json /tmp/eval.json
@@ -20,7 +20,7 @@ spark.sql("CREATE DATABASE IF NOT EXISTS qualibot")
 local = lambda q: re.sub(r"\buat_proj\.qualibot\.", "qualibot.", q)
 
 dumps = [json.load(open(p)) for p in sys.argv[1:]]
-for d in dumps:                                   # tables first: the views of one notebook read the other's tables
+for d in dumps:
     for q in d["statements"]:
         if q.startswith("CREATE TABLE"):
             spark.sql(local(q))
@@ -33,13 +33,29 @@ for d in dumps:                                   # tables first: the views of o
         cols = [f"CAST({f.name} AS {f.dataType.simpleString()}) AS {f.name}" if f.name in df.columns
                 else f"CAST(NULL AS {f.dataType.simpleString()}) AS {f.name}" for f in schema.fields]
         df.selectExpr(*cols).write.insertInto(name)
-for d in dumps:
-    for q in d["statements"]:
-        if q.startswith("CREATE OR REPLACE VIEW"):
-            spark.sql(local(q))
-            view = re.match(r"CREATE OR REPLACE VIEW (\S+)", local(q)).group(1)
-            out = spark.table(view)
-            print(f"✓ {view}: {out.count()} rows · columns {out.columns}")
+assert not any(q.startswith("CREATE OR REPLACE VIEW") for d in dumps for q in d["statements"]), "no view expected"
+DASHBOARD_QUERIES = {
+    "daily quality": """SELECT DATE(created_at) AS day, endpoint_name, COUNT(*) AS n,
+                               AVG(IF(turn_verdict = 'bad', 1.0, 0.0)) AS bad_rate, SUM(estimated_cost_usd) AS cost
+                        FROM qualibot.chat_quality_scores WHERE turn_verdict IS NOT NULL GROUP BY ALL""",
+    "failure reasons": """SELECT reason, COUNT(*) AS n
+                          FROM qualibot.chat_quality_scores LATERAL VIEW explode(failure_reasons) r AS reason GROUP BY reason""",
+    "scorers over time": """SELECT DATE(created_at) AS day, assessment_name, AVG(value_numeric) AS mean_value
+                            FROM qualibot.chat_quality_assessments GROUP BY ALL""",
+    "evaluation metrics": """SELECT started_at, endpoint, subset, scorers_config_id, metric, score, ci_low, ci_high
+                             FROM qualibot.ka_eval_metrics""",
+    "shared scorers": """SELECT 'production' AS context, assessment_name, AVG(value_numeric) AS mean_value
+                         FROM qualibot.chat_quality_assessments
+                         WHERE assessment_name IN ('relevance', 'groundedness', 'missed_answer') GROUP BY ALL
+                         UNION ALL
+                         SELECT 'evaluation', assessment_name, AVG(value_numeric)
+                         FROM qualibot.ka_eval_assessments
+                         WHERE assessment_name IN ('relevance', 'groundedness', 'missed_answer') GROUP BY ALL""",
+}
+for name, q in DASHBOARD_QUERIES.items():
+    if all(spark.catalog.tableExists(t) for t in re.findall(r"qualibot\.\w+", q)):
+        out = spark.sql(q)
+        print(f"✓ {name}: {out.count()} rows · columns {out.columns}")
 t = spark.sql("DESCRIBE TABLE EXTENDED qualibot.chat_quality_scores").filter("col_name = 'Comment'").collect() \
     if spark.catalog.tableExists("qualibot.chat_quality_scores") else []
 print("table comment:", t[0].data_type[:80] if t else "n/a")

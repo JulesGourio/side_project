@@ -3,42 +3,52 @@
 # MAGIC %md
 # MAGIC # Qualibot — Knowledge Assistant Evaluation
 # MAGIC
-# MAGIC Evaluates a Knowledge Assistant endpoint against the golden evaluation dataset stored in Unity Catalog, with
-# MAGIC MLflow GenAI evaluation, and writes the results to Unity Catalog tables for the dashboard.
+# MAGIC Calls a Knowledge Assistant endpoint on every case of the golden dataset, scores the answers with MLflow judges and
+# MAGIC writes the results to Unity Catalog.
 # MAGIC
-# MAGIC ### Quality dimensions
+# MAGIC ### What the judges read
+# MAGIC - **Case**: the question (with its conversation) and the expectations of the golden dataset (expected facts,
+# MAGIC   expected documents, guidelines).
+# MAGIC - **Answer**: the assistant's answer, without the text fragments of citation links (`#:~:text=…`).
+# MAGIC - **Evidence** (`RETRIEVER` step `cited_document_excerpts`): for every document the answer relies on (documents it
+# MAGIC   returned and codes it writes), the chunks of that document found by searching the index with the question, with
+# MAGIC   each line of the answer that cites the document, and with each passage the assistant quoted from it. No limit on
+# MAGIC   the number of documents or chunks, no truncation. These chunks are re-retrieved: they are not guaranteed to be the
+# MAGIC   exact passages the assistant read.
+# MAGIC
+# MAGIC ### Scorers
 # MAGIC | Axis | Scorer | Type | Question answered |
 # MAGIC |---|---|---|---|
-# MAGIC | Correctness | `correctness` | built-in | Does the answer contain the expected facts (or match the expected answer)? |
-# MAGIC | | `fact_coverage` | LLM judge | full / partial / none — finer than a yes/no; can be aligned on human ratings |
+# MAGIC | Correctness | `correctness` | built-in | Does the answer contain the expected facts? |
+# MAGIC | | `fact_coverage` | LLM judge | full / partial / none share of the expected facts |
 # MAGIC | | `fact_contradiction` | LLM judge | Does the answer contradict an expected fact? |
-# MAGIC | | `refusal_handling` | LLM judge | When the expected behaviour is a refusal, does the assistant refuse without inventing? |
+# MAGIC | | `refusal_handling` | LLM judge | When a refusal is expected, does the assistant refuse without inventing? |
 # MAGIC | Answer | `relevance` ¹, `language_match` ¹ | LLM judge | Does the answer address the question, in the user's language? |
-# MAGIC | | `expectations_guidelines` | built-in | Case-specific guidelines (mandatory citation, …) |
-# MAGIC | Faithfulness | `groundedness` ¹ | LLM judge on the `RETRIEVER` step | Is the answer supported by the excerpts of the documents it cites? |
-# MAGIC | | `missed_answer` ¹ | LLM judge on the `RETRIEVER` step | Does the answer say "not found" while the excerpts contain the information? |
-# MAGIC | Retrieval | `retrieval_sufficiency` | built-in, on the `RETRIEVER` step | Do those excerpts contain what the expected answer needs? (cases with expected facts) |
-# MAGIC | | `document_recall` | code | Share of the expected documents the assistant returned or cited |
-# MAGIC | | `reference_integrity` ¹ | code | Every cited document code exists (typos such as missing zero padding are resolved, not penalised) |
+# MAGIC | | `expectations_guidelines` | built-in | Are the case's guidelines followed? |
+# MAGIC | Faithfulness | `groundedness` ¹ | LLM judge on the evidence | Are the answer's claims supported by the evidence? |
+# MAGIC | | `missed_answer` ¹ | LLM judge on the evidence | Does the answer say "not found" while the evidence holds it? |
+# MAGIC | Retrieval | `retrieval_sufficiency` | built-in, on the evidence | Does the evidence hold what the expected answer needs? |
+# MAGIC | | `document_recall` | code | Share of the expected documents returned or cited |
+# MAGIC | | `reference_integrity` ¹ | code | Does every cited document code exist? |
 # MAGIC | Operations | `call_ok`, `latency_s` | code | Endpoint availability and response time |
 # MAGIC
-# MAGIC ¹ identical in the production monitoring notebook, so that golden-dataset and production results can be compared.
+# MAGIC ¹ identical in the production monitoring notebook.
 # MAGIC
 # MAGIC ### Outputs
 # MAGIC | Where | Content |
 # MAGIC |---|---|
-# MAGIC | `ka_eval_runs` | one row per evaluation run: endpoint, subset, judge model, scorer configuration |
+# MAGIC | `ka_eval_runs` | one row per run: endpoint, subset, judge model, scorer configuration |
 # MAGIC | `ka_eval_metrics` | one row per run × metric: score, 95% confidence interval, number of cases |
 # MAGIC | `ka_eval_results` | one row per run × case: question, answer, documents, one column per metric, human rating |
-# MAGIC | `ka_eval_assessments` | one row per run × case × scorer (value, numeric value, rationale, error), human ratings included |
-# MAGIC | `v_ka_eval_metrics`, `v_ka_eval_case_history`, `v_quality_shared_scorers` | dashboard-ready views (the last one puts the shared scorers of evaluation and production side by side) |
-# MAGIC | MLflow experiment | **Runs**: one per endpoint and repetition · **Traces**: one per case (assistant call, cited excerpts, every verdict) · **Judges / Scorers**: every scorer above, registered but not scheduled · **Datasets**: the golden dataset, linked to every run |
+# MAGIC | `ka_eval_assessments` | one row per run × case × scorer: value, numeric value, rationale, error |
+# MAGIC | MLflow experiment | Runs (one per endpoint and repetition), Traces (one per case), Judges (every scorer, not scheduled), Datasets (the golden dataset, linked to every run) |
+# MAGIC
+# MAGIC Every row carries its run's start time, subset and scorer configuration.
 # MAGIC
 # MAGIC ### How to use
-# MAGIC 1. Run the cells down to **Case selection** with `run_eval=false` to review the selected cases and the estimated number of calls.
-# MAGIC 2. Set `run_eval=true` (start with `sample_n=5`), then read the **Report**; the tables are written by the report.
-# MAGIC 3. Use **Human labels** to rate a few answers: the agreement between you and the judges tells whether the scores can
-# MAGIC    be trusted, and the same labels can align `fact_coverage` (**Judge alignment**).
+# MAGIC 1. Run down to **Case selection** with `run_eval=false` to check the cases and the number of calls.
+# MAGIC 2. Set `run_eval=true` (start with `sample_n=5`) and read the **Report**, which writes the tables.
+# MAGIC 3. Rate a few answers in **Human labels**: the agreement with the judges tells whether the scores can be trusted.
 
 # COMMAND ----------
 
@@ -87,7 +97,7 @@ dbutils.widgets.text("sample_n", "5")                               # empty = ev
 dbutils.widgets.text("case_ids", "")                                # comma-separated case ids (overrides sample_n)
 dbutils.widgets.text("repeats", "1")                                # >1 measures the assistant's variability
 dbutils.widgets.dropdown("run_eval", "false", ["true", "false"])
-dbutils.widgets.text("output_schema", "uat_proj.qualibot")         # result tables and views
+dbutils.widgets.text("output_schema", "uat_proj.qualibot")         # result tables
 
 DATASET_NAME = dbutils.widgets.get("dataset_name").strip()
 EXPERIMENT_PATH = dbutils.widgets.get("experiment_path").strip()
@@ -104,20 +114,25 @@ RUNS_TABLE = f"{OUTPUT_SCHEMA}.ka_eval_runs"
 METRICS_TABLE = f"{OUTPUT_SCHEMA}.ka_eval_metrics"
 RESULTS_TABLE = f"{OUTPUT_SCHEMA}.ka_eval_results"
 ASSESSMENTS_TABLE = f"{OUTPUT_SCHEMA}.ka_eval_assessments"
-PRODUCTION_ASSESSMENTS_TABLE = f"{OUTPUT_SCHEMA}.chat_quality_assessments"   # written by the production scoring job
 
 # Retrieval context used to verify the answers (documents cited by the assistant)
 VS_INDEX = "uat_landingzone.qualibot.chunks_index_v1"
 VS_COLUMNS = ["REF", "chunk_text", "semantic_headers"]
 REF_SOURCE_TABLE = None          # source table of the index; None = read from the index definition
-EXCERPTS_PER_DOCUMENT = 3        # excerpts per cited document
-MAX_DOCUMENTS_CHECKED = 6        # cited documents checked per case
-EXCERPT_MAX_CHARS = 1500
+EXCERPTS_PER_QUERY = 3           # chunks kept per search (question, citing passage or quoted passage of a document)
 
 # Optional case metadata (question type, difficulty, expected answerability) written by the dataset builder
 GOLDEN_CACHE_TABLE = "uat_landingzone.qualibot.qualibot_eval_cache"
 
 MAX_PARALLEL_CALLS = 3           # capacity limit of the Knowledge Assistant endpoints
+
+# Judge model rate limits (pay-per-token endpoint, shared with every other use of the model)
+JUDGE_INPUT_TOKENS_PER_MINUTE = 200_000
+JUDGE_OUTPUT_TOKENS_PER_MINUTE = 20_000
+JUDGE_RATE_SHARE = 0.7           # share of the limits used by this notebook
+JUDGE_MAX_RETRIES = 7            # retries of a call rejected for rate limit (1 s, 2 s … 60 s: about 2 minutes)
+INPUT_TOKENS_PER_JUDGE_CALL = 8000    # judge prompt: instructions, case, answer and, for 3 judges, the excerpts
+OUTPUT_TOKENS_PER_JUDGE_CALL = 800    # rationale + hidden reasoning of a "thinking" judge model
 SEED = 42
 LANG_SUFFIXES = ["FR", "GB", "EN", "UK", "CZ", "ES", "DE", "PT", "IT", "MX", "BG", "RO", "PL", "TN"]
 TRACES_CATALOG, TRACES_SCHEMA = "uat_proj", "qualibot"      # Unity Catalog location of the evaluation traces
@@ -278,28 +293,101 @@ def answer_context(trace) -> dict:
     return next((s.outputs for s in trace.search_spans(name="answer_context") if isinstance(s.outputs, dict)), {})
 
 
-@mlflow.trace(name="cited_document_excerpts", span_type="RETRIEVER")
-def cited_document_excerpts(query: str, cited_documents: list) -> list:
-    """Excerpts of the cited documents most related to the question and the answer: up to EXCERPTS_PER_DOCUMENT
-    excerpts for each of the first MAX_DOCUMENTS_CHECKED cited documents (Vector Search, filtered on each document and
-    its language variants), so that every checked document is represented. Shown as a RETRIEVER step so that the
-    retrieval judges can use them and they are readable in the trace."""
-    documents = {}
-    for ref in cited_documents:
-        key = base_ref(ref)
+# ── Evidence of the cited documents: the excerpts read by the retrieval judges (RETRIEVER step) ──
+# Every document the answer relies on is checked, with no limit on the number of documents or excerpts and no
+# truncation: each document is searched with the question, with every passage of the answer that cites it, and with
+# the passages the assistant quoted from it (citation link fragments and footnotes).
+_MARKER = re.compile(r"⟦\s*(\d+)\s*⟧")
+_FOOTNOTE_REF = re.compile(r"\[\^([^\]\s]+)\](?!:)")
+_FOOTNOTE_DEF = re.compile(r"^\s*\[\^([^\]\s]+)\]:(.*)$")
+_MD_LINK = re.compile(r"\[([^\]]*)\]\((https?://[^)\s]+)\)")
+_URL = re.compile(r"https?://[^\s)\]>\"'\\]+")
+_CODE_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9_.\-]{2,28}")
+MIN_QUERY_CHARS = 15
+
+
+def quoted_passage(url: str) -> str:
+    """Passage of a citation link's text fragment (#:~:text=[prefix-,]start[,end][,-suffix]), decoded."""
+    from urllib.parse import unquote
+
+    fragment = url.split("#:~:text=", 1)[1] if "#:~:text=" in url else ""
+    parts = [p for p in fragment.split("&")[0].split(",") if p and not p.endswith("-") and not p.startswith("-")]
+    return " … ".join(unquote(p) for p in parts).strip()
+
+
+def _search_text(text: str) -> str:
+    """Answer passage as a search query: links, citation markers and Markdown syntax removed."""
+    text = _MD_LINK.sub(lambda m: m.group(1), str(text))
+    text = _URL.sub(" ", _FOOTNOTE_REF.sub(" ", _MARKER.sub(" ", text)))
+    return re.sub(r"\s+", " ", re.sub(r"[#|>]+|-{3,}", " ", re.sub(r"[*`]+", "", text))).strip()
+
+
+def evidence_queries(question: str, raw_answer: str, documents: list, link_text: str = "") -> dict:
+    """Search queries of every document the answer relies on: {cited code: [queries]}.
+    documents: (code, citation number or None) pairs, e.g. the assistant's sources (number n of the ⟦n⟧ markers) and
+    the codes written in the answer. Queries of a document: the question; each line of the answer that cites it
+    (⟦n⟧ marker, footnote pointing to it, or its code written in the line); each passage the assistant quoted from it
+    (text fragment of a citation link, footnote text). link_text: other text holding citation links (raw response)."""
+    raw_answer = str(raw_answer or "")
+    names, numbers = {}, {}
+    for code, number in documents:
+        key = base_ref(code)
         if len(key) >= 4 and key in REFS_BY_BASE:
-            documents.setdefault(key, sorted(REFS_BY_BASE[key]))
-    excerpts = []
-    for variants in list(documents.values())[:MAX_DOCUMENTS_CHECKED]:
-        res = w.vector_search_indexes.query_index(
-            index_name=VS_INDEX, columns=VS_COLUMNS, query_text=query[:2000], query_type="HYBRID",
-            num_results=EXCERPTS_PER_DOCUMENT, filters_json=json.dumps({"REF": variants}))
-        cols = [c.name for c in res.manifest.columns]
-        rows = [dict(zip(cols, r)) for r in ((res.result.data_array if res.result else None) or [])]
-        excerpts += [Document(id=f"{r.get('REF')}#{len(excerpts) + i}",
-                              page_content=str(r.get("chunk_text") or "")[:EXCERPT_MAX_CHARS],
-                              metadata={"doc_uri": r.get("REF"), "section": str(r.get("semantic_headers") or "")[:200]})
-                     for i, r in enumerate(rows)]
+            names.setdefault(key, str(code).strip())
+            if number is not None:
+                numbers.setdefault(str(number), set()).add(key)
+    queries = {key: [question] for key in names}
+
+    def keys_in(text: str) -> set:
+        return {base_ref(t) for t in _CODE_TOKEN.findall(text)} & set(names)
+
+    def add(keys, text):
+        text = _search_text(text)
+        if len(text) >= MIN_QUERY_CHARS:
+            for key in keys:
+                if text not in queries[key]:
+                    queries[key].append(text)
+
+    lines, footnotes = [], {}
+    for line in raw_answer.splitlines():
+        m = _FOOTNOTE_DEF.match(line)
+        if m:
+            footnotes[m.group(1)] = keys_in(m.group(2))
+            add(footnotes[m.group(1)], m.group(2))              # passage quoted in the footnote
+        else:
+            lines.append(line)
+    for line in lines:
+        keys = keys_in(line) | {k for n in _MARKER.findall(line) for k in numbers.get(n, ())} \
+               | {k for f in _FOOTNOTE_REF.findall(line) for k in footnotes.get(f, ())}
+        add(keys, line)
+    for label, url in _MD_LINK.findall(raw_answer + "\n" + str(link_text or "")):
+        add(keys_in(label) | keys_in(url.split("#")[0]), quoted_passage(url))
+    for url in _URL.findall(str(link_text or "")):
+        add(keys_in(url.split("#")[0]), quoted_passage(url))
+    return {names[key]: q for key, q in queries.items()}
+
+
+@mlflow.trace(name="cited_document_excerpts", span_type="RETRIEVER")
+def cited_document_excerpts(queries_by_document: dict) -> list:
+    """Excerpts of every document the answer relies on, grouped by document: for each query of the document (see
+    evidence_queries), the EXCERPTS_PER_QUERY most related chunks of that document and its language variants (Vector
+    Search, hybrid), without duplicates and untruncated. Shown as a RETRIEVER step so that the retrieval judges can use
+    them and they are readable in the trace."""
+    excerpts, seen = [], set()
+    for code, queries in queries_by_document.items():
+        variants = sorted(REFS_BY_BASE.get(base_ref(code), ()))
+        for query in queries if variants else ():
+            res = w.vector_search_indexes.query_index(
+                index_name=VS_INDEX, columns=VS_COLUMNS, query_text=query[:2000], query_type="HYBRID",
+                num_results=EXCERPTS_PER_QUERY, filters_json=json.dumps({"REF": variants}))
+            cols = [c.name for c in res.manifest.columns]
+            for r in (dict(zip(cols, row)) for row in ((res.result.data_array if res.result else None) or [])):
+                text = str(r.get("chunk_text") or "")
+                if text and (r.get("REF"), text) not in seen:
+                    seen.add((r.get("REF"), text))
+                    excerpts.append(Document(id=f"{r.get('REF')}#{len(excerpts)}", page_content=text,
+                                             metadata={"doc_uri": r.get("REF"),
+                                                       "section": str(r.get("semantic_headers") or "")[:200]}))
     return excerpts
 
 # ── Numeric form of a verdict: 1 = pass, 0 = fail, 0.5 = partial; counts and durations as is; NULL for labels ──
@@ -441,6 +529,7 @@ from mlflow.entities.trace_location import UnityCatalog
 w = WorkspaceClient()
 os.environ["MLFLOW_TRACING_SQL_WAREHOUSE_ID"] = SQL_WAREHOUSE_ID          # traces are stored in Unity Catalog
 os.environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] = str(MAX_PARALLEL_CALLS)
+os.environ["MLFLOW_GENAI_EVAL_MAX_RETRIES"] = str(JUDGE_MAX_RETRIES)      # rate-limited judge calls are retried
 os.environ["MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"] = "True"   # no extra assistant call before the run
 
 # The evaluation experiment stores its traces in Unity Catalog tables <prefix>_otel_*; created once, reused afterwards
@@ -613,18 +702,20 @@ def make_predict_fn(endpoint: str):
         except Exception as e:
             mlflow.update_current_trace(tags={**tags, "call_ok": "false"})
             record_answer_context({"error": str(e)[:1000], "returned_refs": [], "cited_refs": []})
-            cited_document_excerpts(question, [])
+            cited_document_excerpts({})
             return ""
         raw_answer = _extract_text(raw) or ""
         answer = clean_answer(raw_answer)          # as read by the judges; the raw answer stays in knowledge_assistant
         returned = sorted(refs_from_response(raw))
         cited = sorted(code_like(raw_answer))
-        docs = cited_document_excerpts(f"{question}\n{answer[:800]}", returned + cited)
+        queries = evidence_queries(question, raw_answer, [(r, None) for r in returned + cited],
+                                   link_text=json.dumps(raw, ensure_ascii=False))
+        docs = cited_document_excerpts(queries)
         refs = classify_refs(cited, "\n".join(d.page_content for d in docs))
         # Short identifiers only in the tags; document lists go to the answer_context step
         mlflow.update_current_trace(tags={**tags, "call_ok": "true", "latency_s": f"{time.time() - t0:.2f}"})
         record_answer_context({"returned_refs": returned, "cited_refs": cited, "error": None,
-                               "excerpt_refs": sorted({d.metadata["doc_uri"] for d in docs}),
+                               "excerpt_refs": sorted({d.metadata["doc_uri"] for d in docs}), "excerpt_count": len(docs),
                                **{f"{k}_refs": v for k, v in refs.items()}})
         return answer
     return predict_fn
@@ -730,6 +821,8 @@ def build_scorers(model):
 # COMMAND ----------
 
 # DBTITLE 1,Judge check and registration — the judge model answers, otherwise fall back to the Databricks-managed judge
+import inspect
+
 JUDGE_MODEL = f"databricks:/{JUDGE_ENDPOINT}" if JUDGE_ENDPOINT else None
 _sample = {"inputs": {"messages": [{"role": "user", "content": "What is the retention period of inspection records?"}]},
            "outputs": "According to QP-1457, inspection records are kept for 10 years.",
@@ -752,7 +845,14 @@ if JUDGE_MODEL and not _judges_work(JUDGE_MODEL):
     JUDGE_MODEL = None
 LLM_JUDGES, TRACE_JUDGES, CODE_SCORERS = build_scorers(JUDGE_MODEL)
 SCORERS = LLM_JUDGES + TRACE_JUDGES + CODE_SCORERS
-SCORERS_CONFIG_ID = scorers_config_id(SCORERS, JUDGE_MODEL, EXCERPTS_PER_DOCUMENT, MAX_DOCUMENTS_CHECKED)
+SCORERS_CONFIG_ID = scorers_config_id(SCORERS, JUDGE_MODEL, inspect.getsource(evidence_queries), EXCERPTS_PER_QUERY)
+
+# Judge pacing: MLflow limits the scorer calls per second. Code scorers and skipped judges take a slot too, hence the
+# ratio of scorers to judge calls.
+_judge_calls_per_minute = JUDGE_RATE_SHARE * min(JUDGE_INPUT_TOKENS_PER_MINUTE / INPUT_TOKENS_PER_JUDGE_CALL,
+                                                 JUDGE_OUTPUT_TOKENS_PER_MINUTE / OUTPUT_TOKENS_PER_JUDGE_CALL)
+SCORER_CALLS_PER_SECOND = _judge_calls_per_minute / 60 * len(SCORERS) / (len(LLM_JUDGES) + len(TRACE_JUDGES))
+os.environ["MLFLOW_GENAI_EVAL_SCORER_RATE_LIMIT"] = f"{SCORER_CALLS_PER_SECOND:.3f}"
 print(f"Judge model: {JUDGE_MODEL or 'Databricks-managed'} · {len(LLM_JUDGES) + len(TRACE_JUDGES)} LLM judges · "
       f"{len(CODE_SCORERS)} code scorers · configuration {SCORERS_CONFIG_ID}")
 publish_scorers(SCORERS, EXPERIMENT_ID, SCORERS_CONFIG_ID)
@@ -782,8 +882,9 @@ else:
 
 n = len(selection)
 print(f"Selection: {subset_label} → {n} cases × {len(ENDPOINTS)} endpoint(s) × {REPEATS} repetition(s)")
-print(f"Estimated calls: {n * len(ENDPOINTS) * REPEATS} assistant calls, "
-      f"~{n * len(ENDPOINTS) * REPEATS * (len(LLM_JUDGES) + len(TRACE_JUDGES))} judge calls at most")
+_judge_calls = n * len(ENDPOINTS) * REPEATS * (len(LLM_JUDGES) + len(TRACE_JUDGES))
+print(f"Estimated calls: {n * len(ENDPOINTS) * REPEATS} assistant calls, ~{_judge_calls} judge calls at most, paced "
+      f"at {_judge_calls_per_minute:.0f} judge calls per minute (at least {_judge_calls / _judge_calls_per_minute:.0f} min)")
 display(selection[["case_id", "intent", "difficulty", "final_answerability", "question"]])
 
 RUN_IDS = []
@@ -797,8 +898,8 @@ if RUN_EVAL:
                 mlflow.set_tags({"endpoint": endpoint, "subset": subset_label, "dataset": DATASET_NAME,
                                  "judge_model": JUDGE_MODEL or "databricks-managed",
                                  "scorers_config_id": SCORERS_CONFIG_ID})
-                mlflow.log_params({"n_cases": n, "repeat": rep, "excerpts_per_document": EXCERPTS_PER_DOCUMENT,
-                                   "max_documents_checked": MAX_DOCUMENTS_CHECKED})
+                mlflow.log_params({"n_cases": n, "repeat": rep, "excerpts_per_query": EXCERPTS_PER_QUERY,
+                                   "judge_rate_share": JUDGE_RATE_SHARE})
                 if subset_label != "full":
                     mlflow.log_input(eval_ds, context="evaluation")   # links a sampled run to the golden dataset too
                 mlflow.genai.evaluate(data=data, predict_fn=make_predict_fn(endpoint), scorers=SCORERS)
@@ -847,6 +948,10 @@ RUNS_COLUMNS = [
 ]
 METRICS_COLUMNS = [
     ("run_id", S, "MLflow run id of the evaluation run"),
+    ("endpoint", S, "Knowledge Assistant serving endpoint evaluated"),
+    ("started_at", S, "Start time (UTC, ISO 8601) of the run"),
+    ("subset", S, "full, sample:<n>:seed<seed> or cases:<ids>"),
+    ("scorers_config_id", S, "Fingerprint of the scorer definitions and judge model: compare runs of the same configuration"),
     ("metric", S, "Scorer name"),
     ("meaning", S, "What the metric measures"),
     ("score", D, "Mean over the cases (1 = best); median response time for latency_s"),
@@ -857,6 +962,9 @@ METRICS_COLUMNS = [
 ]
 RESULTS_COLUMNS = [
     ("run_id", S, "MLflow run id of the evaluation run"),
+    ("started_at", S, "Start time (UTC, ISO 8601) of the run"),
+    ("subset", S, "full, sample:<n>:seed<seed> or cases:<ids>"),
+    ("scorers_config_id", S, "Fingerprint of the scorer definitions and judge model: compare runs of the same configuration"),
     ("case_id", S, "Golden case id (question id of the dataset builder)"),
     ("endpoint", S, "Knowledge Assistant serving endpoint evaluated"),
     ("question", S, "Question of the case (last user message)"),
@@ -865,7 +973,7 @@ RESULTS_COLUMNS = [
     ("final_answerability", S, "full, partial, none or out_of_scope: whether the documentation answers the question"),
     ("expected", S, "Expected facts (one per line), or the expected answer for refusal cases"),
     ("expected_sources", A, "Documents the answer should rely on"),
-    ("answer", S, "Assistant answer, without citation text fragments, truncated to 4000 characters"),
+    ("answer", S, "Assistant answer, without citation text fragments"),
     ("returned_refs", A, "Documents returned by the assistant as citations"),
     ("cited_refs", A, "Document codes cited in the answer text"),
     ("unverified_refs", A, "Cited codes found neither in the index nor in the excerpts"),
@@ -876,6 +984,9 @@ RESULTS_COLUMNS = [
 ]
 ASSESSMENTS_COLUMNS = [
     ("run_id", S, "MLflow run id of the evaluation run"),
+    ("started_at", S, "Start time (UTC, ISO 8601) of the run"),
+    ("subset", S, "full, sample:<n>:seed<seed> or cases:<ids>"),
+    ("scorers_config_id", S, "Fingerprint of the scorer definitions and judge model: compare runs of the same configuration"),
     ("case_id", S, "Golden case id"),
     ("endpoint", S, "Knowledge Assistant serving endpoint evaluated"),
     ("trace_id", S, "MLflow trace of the case"),
@@ -894,32 +1005,6 @@ TABLES = {
                                              "human ratings included."),
 }
 SCHEMAS = {t: StructType([StructField(n, dt) for n, dt, _ in cols]) for t, (cols, _) in TABLES.items()}
-VIEWS = {
-    "v_ka_eval_metrics": ("Evaluation metrics with their run context, one row per run and metric", f"""
-        SELECT r.started_at, r.run_name, r.endpoint, r.subset, r.n_cases, r.judge_model, r.scorers_config_id,
-               m.metric, m.meaning, m.score, m.ci_low, m.ci_high, m.p95, m.n, r.run_id
-        FROM {RUNS_TABLE} r JOIN {METRICS_TABLE} m USING (run_id)"""),
-    "v_ka_eval_case_history": ("Per-case results across evaluation runs: spot regressions and unstable cases", f"""
-        SELECT r.started_at, r.subset, r.scorers_config_id, c.*
-        FROM {RUNS_TABLE} r JOIN {RESULTS_TABLE} c ON c.run_id = r.run_id"""),
-    "v_quality_shared_scorers": ("Scorers shared by the evaluation and the production monitoring, side by side: "
-                                 "daily means in production, run means in evaluation", f"""
-        SELECT 'production' AS context, DATE(created_at) AS day, endpoint_name AS endpoint, assessment_name,
-               COUNT(*) AS n, AVG(value_numeric) AS mean_value, CAST(NULL AS STRING) AS run_id
-        FROM {PRODUCTION_ASSESSMENTS_TABLE}
-        WHERE assessment_name IN ('relevance', 'language_match', 'groundedness', 'missed_answer', 'reference_integrity')
-          AND error IS NULL
-        GROUP BY ALL
-        UNION ALL
-        SELECT 'evaluation' AS context, DATE(r.started_at) AS day, a.endpoint, a.assessment_name,
-               COUNT(*) AS n, AVG(a.value_numeric) AS mean_value, a.run_id
-        FROM {ASSESSMENTS_TABLE} a JOIN {RUNS_TABLE} r USING (run_id)
-        WHERE a.assessment_name IN ('relevance', 'language_match', 'groundedness', 'missed_answer', 'reference_integrity')
-          AND a.error IS NULL AND a.source_type <> 'HUMAN'
-        GROUP BY ALL"""),
-}
-
-
 def run_traces(run_id: str) -> list:
     """Traces of an evaluation run, with their tags, answer and assessments."""
     out = []
@@ -992,7 +1077,7 @@ def _expected_text(exp) -> str:
 
 
 def write_run_tables(run_id: str, res: pd.DataFrame, summary: pd.DataFrame):
-    """Writes (or rewrites) one evaluation run in the four tables, then refreshes the views."""
+    """Writes (or rewrites) one evaluation run in the four tables."""
     run = mlflow.get_run(run_id)
     tags, params = run.data.tags, run.data.params
     endpoint = tags.get("endpoint")
@@ -1001,22 +1086,23 @@ def write_run_tables(run_id: str, res: pd.DataFrame, summary: pd.DataFrame):
                "dataset_name": tags.get("dataset"), "subset": tags.get("subset"), "n_cases": params.get("n_cases"),
                "repeat": params.get("repeat"), "judge_model": tags.get("judge_model"),
                "scorers_config_id": tags.get("scorers_config_id"), "experiment_id": EXPERIMENT_ID}
-    metric_rows = [{"run_id": run_id, **r} for r in summary.to_dict("records")]
+    context = {k: run_row[k] for k in ("started_at", "subset", "scorers_config_id")}
+    metric_rows = [{"run_id": run_id, "endpoint": endpoint, **context, **r} for r in summary.to_dict("records")]
     result_rows, assessment_rows = [], []
     for _, r in res.iterrows():
         exp = r.get("expectations") if isinstance(r.get("expectations"), dict) else {}
         ctx = r["_context"]
         result_rows.append({
-            "run_id": run_id, "case_id": r["case_id"], "endpoint": endpoint, "question": r.get("question"),
+            "run_id": run_id, **context, "case_id": r["case_id"], "endpoint": endpoint, "question": r.get("question"),
             "intent": r.get("intent"), "difficulty": r.get("difficulty"),
             "final_answerability": r.get("final_answerability"), "expected": _expected_text(exp),
             "expected_sources": [clean_ref(d["doc_uri"]) for d in exp.get("expected_retrieved_context", [])],
-            "answer": str(r.get("answer") or "")[:4000],
+            "answer": str(r.get("answer") or ""),
             "returned_refs": ctx.get("returned_refs") or [], "cited_refs": ctx.get("cited_refs") or [],
             "unverified_refs": ctx.get("unverified_refs") or [], "trace_id": r["trace_id"],
             **{m: r.get(m) for m in METRICS}, "human_fact_coverage": r.get("human::fact_coverage"),
             "failed_scorers": [m for m in FAILURE_METRICS if r.get(m) == 0]})
-        assessment_rows += [{"run_id": run_id, "case_id": r["case_id"], "endpoint": endpoint, "trace_id": r["trace_id"],
+        assessment_rows += [{"run_id": run_id, **context, "case_id": r["case_id"], "endpoint": endpoint, "trace_id": r["trace_id"],
                              "assessment_name": a["name"], "source_type": a["source_type"],
                              "value": a["value"] if isinstance(a["value"], str) or a["value"] is None else json.dumps(a["value"]),
                              "value_numeric": numeric_value(a["name"], a["value"]), "rationale": a["rationale"],
@@ -1026,13 +1112,6 @@ def write_run_tables(run_id: str, res: pd.DataFrame, summary: pd.DataFrame):
         cols, comment = TABLES[table]
         ensure_table(table, SCHEMAS[table], comment, {n: d for n, _, d in cols})
         replace_rows(table, SCHEMAS[table], rows, ["run_id"])
-    for name, (comment, query) in VIEWS.items():
-        if name == "v_quality_shared_scorers" and not spark.catalog.tableExists(PRODUCTION_ASSESSMENTS_TABLE):
-            continue
-        try:
-            spark.sql(f"CREATE OR REPLACE VIEW {OUTPUT_SCHEMA}.{name} COMMENT '{_sql_text(comment)}' AS {query}")
-        except Exception as e:                  # a view created by another identity cannot be replaced
-            print(f"⚠️ view {name} not refreshed: {str(e)[:150]}")
     print(f"✓ run {run_id} written to {RUNS_TABLE}, {METRICS_TABLE}, {RESULTS_TABLE} ({len(result_rows)} cases), "
           f"{ASSESSMENTS_TABLE} ({len(assessment_rows)} rows)")
 
@@ -1095,13 +1174,11 @@ else:
 
 # DBTITLE 1,Run comparison — from ka_eval_metrics; compare runs of the same subset and scorer configuration
 if spark.catalog.tableExists(METRICS_TABLE):
-    history = spark.sql(f"""
-        SELECT r.started_at, r.run_name, r.subset, r.scorers_config_id, m.metric, m.score
-        FROM {RUNS_TABLE} r JOIN {METRICS_TABLE} m USING (run_id)
-        ORDER BY r.started_at DESC""").toPandas()
-    view = (history.pivot_table(index=["started_at", "run_name", "subset", "scorers_config_id"], columns="metric",
-                                values="score").sort_index(ascending=False).head(20).round(3))
-    display(view.reset_index())
+    history = spark.table(METRICS_TABLE).select("started_at", "endpoint", "subset", "scorers_config_id", "metric",
+                                                "score").toPandas()
+    table = (history.pivot_table(index=["started_at", "endpoint", "subset", "scorers_config_id"], columns="metric",
+                                 values="score").sort_index(ascending=False).head(20).round(3))
+    display(table.reset_index())
     print("Compare runs of the same subset and scorer configuration only. "
           "On 20-30 cases, differences below ~10 points are noise.")
 else:

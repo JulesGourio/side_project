@@ -94,6 +94,13 @@ class SparkSQL:
         if m:
             rows, schema = self.temp[m.group(2)]
             self.tables[m.group(1)].extend(dict(zip([f.name for f in schema.fields], r)) for r in rows)
+        m = re.match(r"\s*MERGE INTO (\S+) t USING \(SELECT DISTINCT (.*?) FROM (\S+)\) s .* WHEN MATCHED THEN DELETE", q)
+        if m and m.group(1) in self.tables:
+            keys = [k.strip() for k in m.group(2).split(",")]
+            rows, schema = self.temp[m.group(3)]
+            names = [f.name for f in schema.fields]
+            new = {tuple(str(dict(zip(names, r))[k]) for k in keys) for r in rows}
+            self.tables[m.group(1)] = [r for r in self.tables[m.group(1)] if tuple(str(r.get(k)) for k in keys) not in new]
         m = re.match(r"\s*CREATE OR REPLACE VIEW (\S+)", q)
         if m: self.views[m.group(1)] = q
         m = re.match(r"\s*DROP TABLE IF EXISTS (\S+)", q)

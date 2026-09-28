@@ -33,7 +33,9 @@ calls = fake_judges(decide)
 
 pdf = pd.DataFrame([
     dict(message_id=1, created_at=pd.Timestamp("2026-09-20"), session_id="s1", division="ALL", endpoint_name="ka-7679a56e-endpoint",
-         trace_id="tr-1", answer="Selon **QP-1457**, les enregistrements sont conservés 10 ans.",
+         trace_id="tr-1", answer="Selon **QP-1457**, les enregistrements sont conservés 10 ans.⟦1⟧\n\nLes enregistrements "
+         "papier sont archivés par le service qualité.⟦1⟧ [QP-1457](https://x/identification.aspx?ref=QP-1457"
+         "#:~:text=records%20are%20kept%2010%20years)",
          sources_json=json.dumps([{"rank": 0, "title": "QP-1457", "url": "https://x/identification.aspx?ref=QP-1457", "n": 1}]),
          prior_messages=[{"role": "user", "content": "Durée de conservation des enregistrements ?"}], next_user_message=None,
          feedback_vote="up", feedback_comment=None),
@@ -97,10 +99,18 @@ ns = {"dbutils": types.SimpleNamespace(widgets=Widgets({"dry_run": "true" if DRY
       "spark": Spark(), "display": lambda *a, **k: print("[display]")}
 run_cells(str(REPO / "Score_Production_QA.py"), ns, skip=("Setup",))
 
+queries = ns["TURNS"]["1"]["evidence_queries"]
+print("evidence queries of turn 1:", queries)
+assert list(queries) == ["QP-1457"] and len(queries["QP-1457"]) == 4, queries        # question, 2 citing lines, quote
+assert "records are kept 10 years" in queries["QP-1457"], queries
+assert all("⟦" not in q and "http" not in q for q in queries["QP-1457"]), queries
+assert set(ns["TURNS"]["2"]["evidence_queries"]) == {"IN_APO_0006"}, ns["TURNS"]["2"]["evidence_queries"]
+
 if not DRY:
     df = ns["df_final"]
     print(df[["message_id", "turn_verdict", "failure_reasons", "groundedness_level", "missed_answer", "unverified_refs", "approximate_refs", "judge_errors"]].to_string())
-    print("tables:", {t: len(r) for t, r in sql.tables.items()}, "| views:", sorted(sql.views))
+    print("tables:", {t: len(r) for t, r in sql.tables.items()})
+    assert not sql.views, "the dashboard reads the tables: no view is created"
     if RESET:
         assert all(len(r) == n and not any(x.get("stale") for x in r) for r, n in
                    [(sql.tables["uat_proj.qualibot.chat_quality_scores"], 4), (sql.tables["uat_proj.qualibot.chat_quality_scoring_runs"], 1)])

@@ -39,7 +39,7 @@ def ka(method, path, body=None):
         url = "https://intraqual.lat.corp/intraqual_prod/identification.aspx?ref=IN_APO_0006#:~:text=APO"
     else:
         text = "Voir **PRLAT549.FR** : outil GDC."
-        url = "https://intraqual.lat.corp/intraqual_prod/identification.aspx?ref=PRLAT549.FR#:~:text=GDC"
+        url = "https://intraqual.lat.corp/intraqual_prod/identification.aspx?ref=PRLAT549.FR#:~:text=outil%20GDC%20de%20gestion%20des%20comp%C3%A9tences"
     return {"output": [{"type": "message", "content": [{"type": "output_text", "text": text,
             "annotations": [{"type": "url_citation", "title": url, "url": url}]}]}]}
 w = MagicMock()
@@ -76,8 +76,15 @@ print(res.drop(columns=["_why", "_tags", "_assessments", "expectations", "answer
 run = mlflow.get_run(ns["RUN_IDS"][-1])
 print("dataset inputs:", [d.dataset.name for d in run.inputs.dataset_inputs])
 print("judge models used:", sorted({c[1] for c in calls}))
-print("tables:", {t: len(r) for t, r in sql.tables.items()}, "| views:", sorted(sql.views))
+print("tables:", {t: len(r) for t, r in sql.tables.items()})
+assert not sql.views, "the dashboard reads the tables: no view is created"
 for tr in mlflow.search_traces(locations=[ns["EXPERIMENT_ID"]], run_id=ns["RUN_IDS"][-1], return_type="list"):
+    for span in tr.search_spans(name="cited_document_excerpts"):
+        queries = (span.inputs or {}).get("queries_by_document") or {}
+        print("evidence queries:", queries)
+        assert all(len(q) >= 2 for q in queries.values()), queries      # the question and at least one citing passage
+        if "PRLAT549.FR" in queries:
+            assert "outil GDC de gestion des compétences" in queries["PRLAT549.FR"], queries               # passage quoted by the assistant
     long_tags = {k: len(v) for k, v in (tr.info.tags or {}).items() if not k.startswith("mlflow.") and len(v) > 250}
     assert not long_tags, f"trace tags longer than 250 characters: {long_tags}"
 print("trace tags all within 250 characters: ok")
