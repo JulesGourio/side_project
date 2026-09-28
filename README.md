@@ -101,7 +101,7 @@ SQL_DUMP=/tmp/scoring.json .venv/bin/python tests/test_scoring.py && SQL_DUMP=/t
 .spark/bin/python tests/test_sql.py /tmp/scoring.json /tmp/eval.json   # table DDL with comments, inserts, dashboard queries
 .spark/bin/python tests/test_neighbours.py    # neighbour expansion of the golden dataset builder
 .spark/bin/python tests/test_golden_export.py # flat golden cases table
-.venv/bin/python tests/test_load.py          # load test against a simulated endpoint: traces, runs, charts (needs requests, databricks-sdk, matplotlib, ipython)
+.venv/bin/python tests/test_load.py          # load test against a simulated endpoint: traces, runs, charts (needs requests, databricks-sdk, matplotlib, ipython); "retries" = client retrying throttled requests
 ```
 
 Registering `@scorer` code scorers is only possible on Databricks: locally, the tests report them as "not registered".

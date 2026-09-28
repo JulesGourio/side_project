@@ -686,6 +686,7 @@ ax_t.plot(x, summary["throughput_rps"], color="#2a78d6", linewidth=2, marker="o"
 ax_t.set_title("Throughput (requests/s)", loc="left", color=INK)
 ax_t.set_xlabel("requests in flight")
 for a in (ax_l, ax_t):
+    a.set_xticks(list(x))
     a.grid(axis="y", color=GRID, linewidth=0.8)
     a.set_ylim(bottom=0)
 fig3.tight_layout()

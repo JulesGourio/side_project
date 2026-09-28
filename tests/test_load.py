@@ -23,8 +23,10 @@ import mlflow  # noqa: E402
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 work = tempfile.mkdtemp()
+os.chdir(work)                      # run artifacts (charts, tables) land in the temporary directory
 mlflow.set_tracking_uri(f"sqlite:///{work}/mlflow.db")
 in_flight, lock = [0], threading.Lock()
+RETRIES = "retries" in sys.argv          # client retrying throttled requests: attempts and backoff steps in the traces
 
 
 class Response:
@@ -89,9 +91,19 @@ databricks.sdk.WorkspaceClient = MagicMock
 shown = []
 ns = {"dbutils": types.SimpleNamespace(widgets=Widgets({
           "concurrency_levels": "2,5,20", "requests_per_level": "40", "n_questions": "3",
-          "pause_between_levels_s": "0", "write_tables": "false", "experiment_path": "/Shared/load-test"})),
+          "pause_between_levels_s": "0", "write_tables": "false", "experiment_path": "/Shared/load-test",
+          "max_retries": "2" if RETRIES else "0"})),
       "spark": MagicMock(), "display": lambda d, *a, **k: shown.append(d)}
 run_cells(str(REPO / "Load_Test_Knowledge_Assistant.py"), ns, skip=("Setup",))
+
+if RETRIES:
+    df = ns["df"]
+    retried = df[df["attempts"] > 1]
+    trace = mlflow.get_trace(retried["trace_id"].iloc[0])
+    names = [sp.name for sp in trace.data.spans]
+    assert len(retried) and "backoff" in names and names.count(f"POST {ns['ENDPOINT']}") > 1, names
+    print(f"✓ retries: {len(retried)} requests retried, attempts and backoff steps in their traces")
+    sys.exit(0)
 
 s = ns["summary"].set_index("phase")
 print(s[["concurrency", "n", "ok", "http_429", "retriever_empty", "latency_p50_s", "throughput_rps"]].to_string())
