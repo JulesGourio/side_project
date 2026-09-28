@@ -36,3 +36,35 @@ checks = {("relevance", "yes"): 1.0, ("missed_answer", "yes"): 0.0, ("missed_ans
 bad = {k: (nv(*k), v) for k, v in checks.items() if nv(*k) != v}
 assert not bad, bad
 print("numeric_value: all", len(checks), "checks pass")
+
+# The assistant's retrieval is read from a real MLflow trace (Trace object) and from its JSON form
+import json
+import mlflow
+from mlflow.entities import Document
+
+mlflow.set_tracking_uri("sqlite:///" + __import__("tempfile").mkdtemp() + "/mlflow.db")
+block = production[production.index("_SOURCE_HEADER = re.compile"):production.index("def record_assistant_retrieval")]
+ns = {"re": re, "json": json, "Document": Document}
+exec(block, ns)
+
+
+@mlflow.trace(span_type="RETRIEVER")
+def vector_search(query):
+    return [Document(page_content="[Source: QP-1457 | Title: Records] Records are kept 10 years.",
+                     metadata={"doc_uri": "https://intraqual/identification.aspx?ref=QP-1457"}),
+            Document(page_content="Chunk without header.", metadata={"doc_uri": "https://intraqual/x.aspx?ref=Q0196QP_FR"})]
+
+
+@mlflow.trace(span_type="AGENT")
+def agent(query):
+    vector_search(query)
+    return "answer"
+
+
+agent("retention?")
+getattr(mlflow, "flush_trace_async_logging", lambda: None)()          # traces are written asynchronously
+trace = mlflow.get_trace(mlflow.get_last_active_trace_id())
+for form in (trace, json.loads(json.dumps(trace.to_dict()))):
+    steps, passages = ns["retrieved_passages"](form)
+    assert steps == 1 and [p.metadata["doc_uri"] for p in passages] == ["QP-1457", "Q0196QP_FR"], (steps, passages)
+print("retrieved_passages: Trace object and JSON form, document codes resolved")

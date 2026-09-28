@@ -8,11 +8,11 @@
 # MAGIC ### What the judges read
 # MAGIC - **Conversation**: the messages the assistant saw (last 10), whole.
 # MAGIC - **Answer**: the stored answer, without the text fragments of citation links (`#:~:text=…`).
-# MAGIC - **Evidence** (`RETRIEVER` step `cited_document_excerpts`): for every document the answer relies on (its sources
-# MAGIC   and the codes it writes), the chunks of that document found by searching the index with the question, with each
-# MAGIC   line of the answer that cites the document, and with each passage the assistant quoted from it. No limit on the
-# MAGIC   number of documents or chunks, no truncation. These chunks are re-retrieved: they are not guaranteed to be the
-# MAGIC   exact passages the assistant read.
+# MAGIC - **Evidence** (`RETRIEVER` step): the passages the assistant retrieved from the `qualibot` index, read from its own
+# MAGIC   MLflow trace (`assistant_retrieval`). When a trace shows no retrieval step, excerpts of every document the answer
+# MAGIC   relies on, searched with each line that cites it (`cited_document_excerpts`). No limit, no truncation.
+# MAGIC - **Independent search** (`corpus_search`): the question searched in the whole index, to tell a retrieval miss from a
+# MAGIC   documentation gap.
 # MAGIC
 # MAGIC ### Scorers
 # MAGIC | Scorer | Type | Values | When |
@@ -23,25 +23,29 @@
 # MAGIC | `language_match` ¹ | LLM judge | yes / no | every turn |
 # MAGIC | `safety` | built-in LLM judge | yes / no | stable 10% sample |
 # MAGIC | `user_reaction` | LLM judge | reaction carried by the user's next message | when the user wrote again |
-# MAGIC | `groundedness` ¹ | LLM judge on the evidence | supported / partially_supported / not_supported | when the answer relies on indexed documents |
-# MAGIC | `missed_answer` ¹ | LLM judge on the evidence | yes when the evidence holds what the answer says it did not find | when the answer relies on indexed documents |
+# MAGIC | `groundedness` ¹ | LLM judge on the evidence | supported / partially_supported / not_supported | when there is evidence |
+# MAGIC | `missed_answer` ¹ | LLM judge on the evidence | yes when the evidence holds what the answer says it did not find | when there is evidence |
+# MAGIC | `retrieval_quality` ¹ | 1-2 LLM judges | sufficient / retrieval_miss / documentation_gap / not_applicable | when the assistant's retrieval is known |
+# MAGIC | `compliance_claim` ¹ | LLM judge on the evidence | evidence_based / unsupported_compliance_claim / not_applicable | every turn |
 # MAGIC | `reference_integrity` ¹, `citation_count` | code | every cited code exists; number of sources | every turn |
 # MAGIC
-# MAGIC ¹ identical in the evaluation notebook. The rule-based **turn verdict** (`good` / `acceptable` / `bad`, with
-# MAGIC `failure_reasons`) combines the scorers.
+# MAGIC ¹ identical in the evaluation notebook. The rule-based **turn verdict** (`good` / `acceptable` / `bad`) combines the
+# MAGIC scorers into `failure_reasons` and the stage at fault, `error_source`: **retrieval** (the index holds what the
+# MAGIC assistant did not retrieve) or **generation** (the model misused or went beyond what it retrieved).
 # MAGIC
 # MAGIC ### Outputs
 # MAGIC | Where | Content |
 # MAGIC |---|---|
-# MAGIC | `chat_quality_scores` | one row per turn: labels, verdict, failure reasons, rationales, documents, cost |
+# MAGIC | `chat_quality_scores` | one row per turn: labels, verdict, failure reasons, stage at fault, evidence, rationales, tokens, cost |
 # MAGIC | `chat_quality_assessments` | one row per turn × scorer: value, numeric value, rationale, error |
 # MAGIC | `chat_quality_scoring_runs` | one row per run: volumes, rates, cost, turns left |
 # MAGIC | MLflow experiment | Runs (one per scoring run), Traces (one per turn, grouped by conversation), Judges (every scorer, not scheduled) |
 # MAGIC
 # MAGIC ### Operations
-# MAGIC - Judge calls are paced to use `JUDGE_RATE_SHARE` of the judge model's token limits. Turns are scored in batches of
-# MAGIC   about one minute of that budget and written after each batch; no batch starts after `max_run_minutes`, and the
-# MAGIC   turns left are scored by the next run.
+# MAGIC - Judge calls are paced to use `JUDGE_RATE_SHARE` of the judge model's token limits, measured with the tokens the
+# MAGIC   model reports. Turns are scored in batches of about one minute of that budget and written after each batch; no
+# MAGIC   batch starts after `max_run_minutes`, and the turns left are scored by the next run.
+# MAGIC - The run stops if the judge model (`judge_endpoint`) does not answer.
 # MAGIC - `dry_run=true`: estimated calls, tokens, cost and duration; nothing is written.
 # MAGIC - `test_limit`: number of turns of an ad-hoc run. `reset_outputs=true`: scores again from scratch and replaces the
 # MAGIC   tables at the first write.
@@ -96,7 +100,7 @@ dbutils.widgets.dropdown("fail_on_alert", "false", ["true", "false"])           
 dbutils.widgets.text("source_schema", "uat_landingzone.qualibot")                 # chat_messages / chat_feedbacks
 dbutils.widgets.text("output_schema", "uat_proj.qualibot")                        # output tables
 dbutils.widgets.text("experiment_path", "/Shared/qualibot-quality-scoring")
-dbutils.widgets.text("judge_endpoint", "databricks-gpt-5-6-luna")                 # empty = Databricks-managed judge model
+dbutils.widgets.text("judge_endpoint", "databricks-gpt-6-luna")                   # judge model serving endpoint
 dbutils.widgets.text("max_run_minutes", "100")      # time budget: no new batch of turns starts after it (backlog absorbed over runs)
 
 TEST_LIMIT = int(dbutils.widgets.get("test_limit")) if dbutils.widgets.get("test_limit").strip() else None
@@ -124,25 +128,28 @@ SAMPLE_RATE = 1.0                      # deterministic sampling on message_id (1
 MAX_TURNS_PER_RUN = 3000               # turns loaded per run; the time budget (max_run_minutes) usually stops earlier
 MAX_PARALLEL_TURNS = 4                 # turns scored in parallel (each turn runs its scorers in parallel too)
 
-# ── Cited document excerpts (RETRIEVER step): every document, untruncated excerpts ──
-VS_INDEX = "uat_landingzone.qualibot.chunks_index_v1"   # index holding ALL chunks (the ALL assistant's index)
+# ── Evidence (RETRIEVER step): the passages the assistant retrieved, read from its own trace ──
+VS_INDEX = "uat_landingzone.qualibot.chunks_index_v1"   # index queried by the assistants
 VS_COLUMNS = ["REF", "chunk_text", "semantic_headers"]
 REF_SOURCE_TABLE = None                # source table of the index; None = read from the index definition
-EXCERPTS_PER_QUERY = 3                 # chunks kept per search (question, citing passage or quoted passage of a document)
+EXCERPTS_PER_QUERY = 3                 # when the trace has no retrieval step: chunks per search of a cited document
+CORPUS_SEARCH_RESULTS = 10             # chunks of the independent search of the whole index (retrieval_quality)
 
 # ── Judge model rate limits (pay-per-token endpoint, shared with every other use of the model) ──
 JUDGE_INPUT_TOKENS_PER_MINUTE = 200_000
-JUDGE_OUTPUT_TOKENS_PER_MINUTE = 20_000       # the binding limit: about 25 judge calls per minute
+JUDGE_OUTPUT_TOKENS_PER_MINUTE = 20_000
 JUDGE_RATE_SHARE = 0.7                 # share of the limits used by this job; the rest stays available to other uses
 JUDGE_MAX_RETRIES = 7                  # retries of a call rejected for rate limit (1 s, 2 s … 60 s: about 2 minutes)
-# The request limits (1,000 per second, 360,000 per hour) are far above the ~30 calls per minute of this job.
+# The request limits (1,000 per second, 360,000 per hour) are far above the calls of this job. The pacing uses the
+# tokens reported by the judge model for each call.
 
-# ── Cost estimate (pay-per-token, DBU per 1M tokens) ──
-DBU_PER_M_INPUT = 2.857
-DBU_PER_M_OUTPUT = 17.143
+# ── Cost (pay-per-token, DBU per 1M tokens), from the tokens reported by the judge model ──
+DBU_PER_M_INPUT = 1.4
+DBU_PER_M_OUTPUT = 7.1
 USD_PER_DBU = 0.07                     # adjust to your contract price for model serving
+# Estimates used before any call is measured (dry run, first batch)
 CHARS_PER_TOKEN = 3.8
-OUTPUT_TOKENS_PER_JUDGE_CALL = 800     # rationale + hidden reasoning of a "thinking" judge model
+OUTPUT_TOKENS_PER_JUDGE_CALL = 400     # rationale + hidden reasoning
 JUDGE_INSTRUCTIONS_CHARS = 2500        # instructions and context of a judge prompt
 DEFAULT_CHUNK_CHARS = 2500             # mean chunk size, used when it cannot be read from the chunks table
 
@@ -238,46 +245,57 @@ def shared_llm_judges(model) -> list:
             for name, (desc, instructions) in SHARED_JUDGES.items()]
 
 
-@scorer(name="groundedness", description="The answer's claims are supported by the excerpts of the documents it cites "
+@scorer(name="groundedness", description="The answer's claims are supported by its evidence: the passages the "
+                                         "assistant retrieved, or excerpts of the documents it cites "
                                          "(supported / partially_supported / not_supported).")
 def groundedness(inputs, outputs, trace):
-    """Checks the answer's factual claims against the excerpts of the documents it cites (RETRIEVER step).
-    Not applicable (no assessment) when the answer cites no document found in the index."""
+    """Checks the answer's factual claims against its evidence (RETRIEVER step): the passages the assistant retrieved
+    when its trace exposes them, otherwise excerpts of the documents it cites. No assessment without evidence."""
     from typing import Literal
 
     from mlflow.entities import SpanType
     from mlflow.genai.judges import make_judge
 
+    context = next((s.outputs for s in trace.search_spans(name="answer_context") if isinstance(s.outputs, dict)), {})
     docs = [d if isinstance(d, dict) else d.to_dict()
             for s in trace.search_spans(span_type=SpanType.RETRIEVER) for d in (s.outputs or [])]
     if not docs:
         return None
-    excerpts = "\n---\n".join(f"[{(d.get('metadata') or {}).get('doc_uri')}] {d.get('page_content')}" for d in docs)
-    question = next((m["content"] for m in reversed(inputs["messages"]) if m["role"] == "user"), "")
-    judge = make_judge(
-        name="groundedness",
-        instructions="""You verify an answer of an assistant on aerospace quality documentation. {{ inputs }} holds the
-user's question and EXCERPTS of the documents the answer cites; {{ outputs }} is the answer.
-List mentally the answer's key factual claims (values, thresholds, deadlines, roles, steps, document identities,
-definitions), ignoring greetings, generic advice and questions to the user. The excerpts are only a SUBSET of the
-documents: a claim absent from the excerpts is not verifiable, which is NOT a contradiction and does NOT lower the
-verdict.
+    evidence = "\n---\n".join(f"[{(d.get('metadata') or {}).get('doc_uri')}] {d.get('page_content')}" for d in docs)
+    if context.get("evidence_source") == "assistant_retrieval":
+        scope = """The evidence is EVERY PASSAGE THE ASSISTANT RETRIEVED before answering: a claim these passages do not
+state was not taken from the documentation (unless it is general knowledge or restates the question).
+Return:
+- supported: every claim is stated by the passages;
+- partially_supported: a claim is only partly supported or close but not exact, or a secondary claim is absent;
+- not_supported: a key claim (value, rule, compliance statement, document identity) is contradicted by the passages or
+  absent from them."""
+    else:
+        scope = """The evidence is EXCERPTS of the documents the answer cites, only a SUBSET of those documents: a claim
+absent from the excerpts is not verifiable, which is NOT a contradiction and does NOT lower the verdict.
 Return:
 - supported: every claim that the excerpts cover is stated by them, even if other claims cannot be checked;
 - partially_supported: a claim that the excerpts cover is only partly supported, or close but not exact;
 - not_supported: at least one claim is contradicted by the excerpts, or the excerpts of that document clearly show it
-  does not say this.
+  does not say this."""
+    judge = make_judge(
+        name="groundedness",
+        instructions="""You verify an answer of an assistant on aerospace quality documentation. {{ inputs }} holds the
+conversation (the last user message is the question) and the evidence; {{ outputs }} is the answer.
+List the answer's key factual claims (values, thresholds, deadlines, roles, steps, document identities, definitions,
+compliance statements), ignoring greetings, generic advice and questions to the user.
+""" + scope + """
 Write the rationale in English and name the unsupported claims, if any.""",
         feedback_value_type=Literal["supported", "partially_supported", "not_supported"],
         model=trace.info.tags.get("judge_model") or None)
-    return judge(inputs={"question": question, "excerpts": excerpts}, outputs=outputs)
+    return judge(inputs={"messages": inputs["messages"], "evidence": evidence}, outputs=outputs)
 
 
-@scorer(name="missed_answer", description="yes when the answer says the information is not available while the excerpts "
-                                          "of the cited documents contain it.")
+@scorer(name="missed_answer", description="yes when the answer says the information is not available, or leaves a part "
+                                          "unanswered, while its evidence contains it.")
 def missed_answer(inputs, outputs, trace):
-    """yes when the answer says the information is not available (or leaves a part unanswered) while the excerpts of
-    the cited documents contain it. Not applicable (no assessment) when no excerpt was retrieved."""
+    """yes when the answer says the information is not available (or leaves a part unanswered) while its evidence
+    (RETRIEVER step) contains it. No assessment without evidence."""
     from typing import Literal
 
     from mlflow.entities import SpanType
@@ -287,17 +305,105 @@ def missed_answer(inputs, outputs, trace):
             for s in trace.search_spans(span_type=SpanType.RETRIEVER) for d in (s.outputs or [])]
     if not docs:
         return None
-    excerpts = "\n---\n".join(f"[{(d.get('metadata') or {}).get('doc_uri')}] {d.get('page_content')}" for d in docs)
-    question = next((m["content"] for m in reversed(inputs["messages"]) if m["role"] == "user"), "")
+    evidence = "\n---\n".join(f"[{(d.get('metadata') or {}).get('doc_uri')}] {d.get('page_content')}" for d in docs)
     judge = make_judge(
         name="missed_answer",
-        instructions="""{{ inputs }} holds a user's question and excerpts of quality documents; {{ outputs }} is an
-assistant's answer. Return yes if the answer says the information is not available, or leaves a part of the question
-unanswered, while the excerpts DO contain that information; otherwise return no. In the rationale (English), state what
-was missed, if anything.""",
+        instructions="""{{ inputs }} holds a conversation with an assistant on quality documentation (the last user
+message is the question) and passages of quality documents; {{ outputs }} is the assistant's answer. Return yes if the
+answer says the information is not available, or leaves a part of the question unanswered, while the passages DO
+contain that information; otherwise return no. In the rationale (English), state what was missed, if anything.""",
         feedback_value_type=Literal["yes", "no"],
         model=trace.info.tags.get("judge_model") or None)
-    return judge(inputs={"question": question, "excerpts": excerpts}, outputs=outputs)
+    return judge(inputs={"messages": inputs["messages"], "evidence": evidence}, outputs=outputs)
+
+
+@scorer(name="retrieval_quality", description="Whether the assistant's retrieval found what the question needs: "
+                                              "sufficient, retrieval_miss (an independent search of the index finds "
+                                              "more), documentation_gap, not_applicable.")
+def retrieval_quality(inputs, trace):
+    """Separates retrieval errors from generation errors. A judge reads the passages the assistant retrieved; when they
+    do not fully answer the question, a second judge reads an independent search of the whole index (corpus_search
+    step). retrieval_miss: the index holds more than the assistant retrieved · documentation_gap: it does not.
+    No assessment when the assistant's retrieval is not in its trace."""
+    from typing import Literal
+
+    from mlflow.entities import Feedback, SpanType
+    from mlflow.genai.judges import make_judge
+
+    context = next((s.outputs for s in trace.search_spans(name="answer_context") if isinstance(s.outputs, dict)), {})
+    if context.get("evidence_source") != "assistant_retrieval":
+        return None
+    retrieved = [d if isinstance(d, dict) else d.to_dict()
+                 for s in trace.search_spans(span_type=SpanType.RETRIEVER) for d in (s.outputs or [])]
+    searched = [d for s in trace.search_spans(name="corpus_search") for d in (s.outputs or []) if isinstance(d, dict)]
+
+    def passages(docs):
+        return "\n---\n".join(f"[{(d.get('metadata') or {}).get('doc_uri') or d.get('doc_uri')}] {d.get('page_content')}"
+                              for d in docs) or "(no passage)"
+
+    judge = make_judge(
+        name="retrieval_quality",
+        instructions="""{{ inputs }} holds a conversation with an assistant on the quality documentation of an aerospace
+manufacturer (the last user message is the question) and passages of that documentation. Do the passages contain the
+information needed to answer the question?
+- full: everything the question asks is in the passages;
+- partial: only part of it;
+- none: nothing relevant;
+- not_applicable: the question needs no documentation (greeting, out-of-scope request, request about the form of the
+  previous answer).
+Write the rationale in English, in one or two sentences, naming what is missing, if anything.""",
+        feedback_value_type=Literal["full", "partial", "none", "not_applicable"],
+        model=trace.info.tags.get("judge_model") or None)
+    first = judge(inputs={"messages": inputs["messages"], "passages": passages(retrieved)})
+    tokens = ["mlflow.assessment.judgeInputTokens", "mlflow.assessment.judgeOutputTokens"]
+    if first.error:
+        return first
+    if first.value in ("full", "not_applicable"):
+        return Feedback(value="sufficient" if first.value == "full" else "not_applicable", rationale=first.rationale,
+                        source=first.source, metadata=first.metadata)
+    second = judge(inputs={"messages": inputs["messages"], "passages": passages(searched)})
+    if second.error:
+        return second
+    rank = {"none": 0, "partial": 1, "full": 2}
+    missed = rank.get(second.value, 0) > rank.get(first.value, 0)
+    metadata = {k: sum(int((f.metadata or {}).get(k) or 0) for f in (first, second)) for k in tokens}
+    return Feedback(value="retrieval_miss" if missed else "documentation_gap", source=first.source, metadata=metadata,
+                    rationale=f"Assistant's passages: {first.value} ({first.rationale}) · Independent search of the "
+                              f"index: {second.value} ({second.rationale})")
+
+
+@scorer(name="compliance_claim", description="On questions asking whether the company meets a requirement: the answer "
+                                             "concludes on compliance only as far as its evidence establishes it "
+                                             "(evidence_based / unsupported_compliance_claim / not_applicable).")
+def compliance_claim(inputs, outputs, trace):
+    """Compliance-matrix questions ("does the company meet requirement X, which document proves it?", "same for Y"):
+    unsupported_compliance_claim when the answer asserts compliance, or presents documents as proof, beyond what its
+    evidence (RETRIEVER step) establishes."""
+    from typing import Literal
+
+    from mlflow.entities import SpanType
+    from mlflow.genai.judges import make_judge
+
+    docs = [d if isinstance(d, dict) else d.to_dict()
+            for s in trace.search_spans(span_type=SpanType.RETRIEVER) for d in (s.outputs or [])]
+    evidence = "\n---\n".join(f"[{(d.get('metadata') or {}).get('doc_uri')}] {d.get('page_content')}"
+                              for d in docs) or "(no passage)"
+    judge = make_judge(
+        name="compliance_claim",
+        instructions="""{{ inputs }} holds a conversation with an assistant on the quality documentation of an aerospace
+manufacturer (the last user message is the question) and the documentation passages behind the answer; {{ outputs }}
+is the answer. Apply this judge only when the question asks whether the company complies with, or meets, a requirement
+(customer requirement, standard, line of a compliance matrix, "same for <requirement>"); otherwise return
+not_applicable.
+- evidence_based: the answer names the internal documents that address the requirement, says what they state, and
+  concludes on compliance only as far as those statements establish it (or says that the evidence is partial or
+  missing);
+- unsupported_compliance_claim: the answer asserts compliance (or non-compliance) that the passages do not establish,
+  or presents documents as proof when they do not address the requirement.
+Write the rationale in English, in one or two sentences.""",
+        feedback_value_type=Literal["evidence_based", "unsupported_compliance_claim", "not_applicable"],
+        model=trace.info.tags.get("judge_model") or None)
+    return judge(inputs={"messages": inputs["messages"], "evidence": evidence}, outputs=outputs)
 
 
 @scorer(name="reference_integrity", description="Every document code cited in the answer exists (resolved typos and "
@@ -319,7 +425,7 @@ def reference_integrity(trace):
     return Feedback(value=not unverified, rationale="; ".join(notes) or "all cited codes exist")
 
 
-SHARED_TRACE_SCORERS = [groundedness, missed_answer, reference_integrity]
+SHARED_TRACE_SCORERS = [groundedness, missed_answer, retrieval_quality, compliance_claim, reference_integrity]
 
 
 # ── Trace steps read by the scorers ──
@@ -334,7 +440,7 @@ def answer_context(trace) -> dict:
     return next((s.outputs for s in trace.search_spans(name="answer_context") if isinstance(s.outputs, dict)), {})
 
 
-# ── Evidence of the cited documents: the excerpts read by the retrieval judges (RETRIEVER step) ──
+# ── Evidence when the assistant's trace does not expose its retrieval: excerpts of the documents it cites ──
 # Every document the answer relies on is checked, with no limit on the number of documents or excerpts and no
 # truncation: each document is searched with the question, with every passage of the answer that cites it, and with
 # the passages the assistant quoted from it (citation link fragments and footnotes).
@@ -431,11 +537,91 @@ def cited_document_excerpts(queries_by_document: dict) -> list:
                                                        "section": str(r.get("semantic_headers") or "")[:200]}))
     return excerpts
 
+# ── What the assistant read: the retrieval steps of its own trace ──
+_SOURCE_HEADER = re.compile(r"\[Source:\s*([^|\]\n]+)")
+
+
+def trace_spans(trace) -> list:
+    """Spans of an MLflow trace as {name, type, inputs, outputs}, from a Trace object or from its JSON form (the trace
+    returned by a serving endpoint called with databricks_options.return_trace)."""
+    data = trace.to_dict() if hasattr(trace, "to_dict") else (trace or {})
+    spans = []
+    for s in ((data.get("data") or {}).get("spans") or []) if isinstance(data, dict) else []:
+        attributes = s.get("attributes") or {}
+
+        def attribute(key):
+            value = attributes.get(key)
+            try:
+                return json.loads(value) if isinstance(value, str) else value
+            except json.JSONDecodeError:
+                return value
+
+        spans.append({"name": s.get("name"), "type": str(s.get("span_type") or attribute("mlflow.spanType") or "").upper(),
+                      "inputs": s.get("inputs", attribute("mlflow.spanInputs")),
+                      "outputs": s.get("outputs", attribute("mlflow.spanOutputs"))})
+    return spans
+
+
+def retrieved_passages(trace) -> tuple:
+    """(number of retrieval steps, passages) of the assistant's trace: every document returned by its RETRIEVER spans,
+    in order, without duplicates, as Documents whose doc_uri is the document code."""
+    steps, passages, seen = 0, [], set()
+    for span in trace_spans(trace):
+        items = span["outputs"]
+        if isinstance(items, dict):
+            items = next((v for v in items.values() if isinstance(v, list)), [])
+        items = [i for i in (items if isinstance(items, list) else []) if isinstance(i, dict)]
+        is_documents = bool(items) and all(any(k in i for k in ("page_content", "content", "chunk_text")) for i in items)
+        if span["type"] != "RETRIEVER" and not is_documents:
+            continue
+        steps += 1
+        for item in items:
+            meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            text = str(item.get("page_content") or item.get("content") or item.get("chunk_text") or item.get("text") or "")
+            header = _SOURCE_HEADER.search(text)
+            uri = str(meta.get("doc_uri") or item.get("doc_uri") or "")
+            in_uri = re.search(r"[?&]ref=([A-Za-z0-9_.\-]+)", uri)
+            doc = (meta.get("REF") or item.get("REF") or (header.group(1).strip() if header else None)
+                   or (in_uri.group(1) if in_uri else None) or uri or meta.get("title") or "")
+            if text and (doc, text) not in seen:
+                seen.add((doc, text))
+                passages.append(Document(id=f"{doc}#{len(passages)}", page_content=text,
+                                         metadata={"doc_uri": str(doc), "step": str(span["name"])}))
+    return steps, passages
+
+
+def record_assistant_retrieval(assistant_trace_id: str, passages: list):
+    """RETRIEVER step holding the passages the assistant retrieved, copied from its own trace."""
+    with mlflow.start_span(name="assistant_retrieval", span_type="RETRIEVER") as span:
+        span.set_inputs({"assistant_trace_id": assistant_trace_id})
+        span.set_outputs(passages)
+
+
+@mlflow.trace(name="corpus_search", span_type="TOOL")
+def corpus_search(query: str) -> list:
+    """Independent hybrid search of the whole index with the question: shows whether the documentation holds what the
+    assistant's retrieval did not find (read by retrieval_quality)."""
+    res = w.vector_search_indexes.query_index(index_name=VS_INDEX, columns=VS_COLUMNS, query_text=query[:2000],
+                                              query_type="HYBRID", num_results=CORPUS_SEARCH_RESULTS)
+    cols = [c.name for c in res.manifest.columns]
+    rows = [dict(zip(cols, row)) for row in ((res.result.data_array if res.result else None) or [])]
+    return [{"doc_uri": r.get("REF"), "page_content": str(r.get("chunk_text") or "")} for r in rows]
+
+
+def search_query(messages: list) -> str:
+    """Question used by the independent search: the last user message, preceded by the previous one when it is a short
+    follow-up ("same for requirement X")."""
+    users = [m["content"] for m in messages if m["role"] == "user"]
+    if not users:
+        return ""
+    return "\n".join(users[-2:]) if len(users) > 1 and len(users[-1]) < 120 else users[-1]
+
 # ── Numeric form of a verdict: 1 = pass, 0 = fail, 0.5 = partial; counts and durations as is; NULL for labels ──
 SCORE_VALUES = {"yes": 1.0, "no": 0.0, "true": 1.0, "false": 0.0, "full": 1.0, "partial": 0.5, "none": 0.0,
                 "supported": 1.0, "partially_supported": 0.5, "not_supported": 0.0,
                 "no_contradiction": 1.0, "contradiction": 0.0, "correct_refusal": 1.0, "answered_anyway": 0.0,
-                "good": 1.0, "acceptable": 0.5, "bad": 0.0, "up": 1.0, "down": 0.0}
+                "good": 1.0, "acceptable": 0.5, "bad": 0.0, "up": 1.0, "down": 0.0,
+                "sufficient": 1.0, "retrieval_miss": 0.0, "evidence_based": 1.0, "unsupported_compliance_claim": 0.0}
 LABEL_SCORERS = {"question_intent", "answer_type", "user_reaction"}   # categorical: no numeric form
 INVERTED_SCORERS = {"missed_answer"}                                                   # "yes" is the failure
 
@@ -453,13 +639,18 @@ def numeric_value(name: str, value):
 
 
 def assessment_row(a) -> dict:
-    """Name, raw value, rationale, source type and error of an MLflow assessment."""
+    """Name, raw value, rationale, source type, error and judge tokens (as reported by the judge model) of an MLflow
+    assessment."""
     value = getattr(a, "value", None)
     fb = getattr(a, "feedback", None)
     err = getattr(fb, "error", None) if fb is not None else None
+    meta = getattr(a, "metadata", None) or {}
+    tokens = lambda key: int(meta[key]) if str(meta.get(key) or "").isdigit() else None
     return {"name": a.name, "value": getattr(value, "value", value), "rationale": getattr(a, "rationale", None),
             "source_type": str(getattr(getattr(a, "source", None), "source_type", "") or "").split(".")[-1].upper(),
-            "error": (getattr(err, "error_message", None) or str(err))[:1000] if err else None}
+            "error": (getattr(err, "error_message", None) or str(err))[:1000] if err else None,
+            "input_tokens": tokens("mlflow.assessment.judgeInputTokens"),
+            "output_tokens": tokens("mlflow.assessment.judgeOutputTokens")}
 
 
 # ── Scorer registration (Judges / Scorers tab), only when the scorer definitions changed ──
@@ -730,13 +921,24 @@ def build_scorers(model):
     kw = {"model": model} if model else {}
     every_turn = [make_judge(name=n, description=d, feedback_value_type=t, instructions=i, **kw)
                   for n, (d, t, i) in PRODUCTION_JUDGES.items()] + shared_llm_judges(model)
-    return every_turn, [user_reaction, groundedness, missed_answer, safety], [reference_integrity, citation_count]
+    return (every_turn, [user_reaction, groundedness, missed_answer, retrieval_quality, compliance_claim, safety],
+            [reference_integrity, citation_count])
 
 # COMMAND ----------
 
-# DBTITLE 1,Turn verdict — actionable rules on top of the scorers
+# DBTITLE 1,Turn verdict — actionable rules on top of the scorers, and the stage at fault (retrieval or generation)
+# Stage at fault of each failure reason: retrieval = the assistant's search did not bring what the index holds;
+# generation = the model misused what it retrieved (claims not in its passages, information it had but left out).
+REASON_STAGE = {"retrieval_miss": "retrieval",
+                "unsupported_claims": "generation", "partially_supported_claims": "generation",
+                "unsupported_compliance_claim": "generation", "missed_answer_in_sources": "generation",
+                "missed_information": "generation", "wrongful_refusal": "generation", "off_topic": "generation",
+                "unverified_reference": "generation", "language_mismatch": "generation", "no_citation": "generation"}
+
+
 def turn_verdict(v: dict) -> tuple:
-    """(verdict, failure_reasons) from the scorer values. bad = the user was badly served; acceptable = minor issue."""
+    """(verdict, failure_reasons, error_source) from the scorer values. bad = the user was badly served; acceptable =
+    minor issue; error_source = retrieval, generation or retrieval_and_generation, from the reasons of the verdict."""
     bad, warn = [], []
     at, intent = v.get("answer_type"), v.get("question_intent")
     if v.get("safety") == "no":
@@ -756,6 +958,13 @@ def turn_verdict(v: dict) -> tuple:
         bad.append("unsupported_claims")
     elif v.get("groundedness") == "partially_supported":
         warn.append("partially_supported_claims")
+    if v.get("compliance_claim") == "unsupported_compliance_claim":
+        bad.append("unsupported_compliance_claim")
+    if v.get("retrieval_quality") == "retrieval_miss":
+        if at in ("not_found", "answered_partial", "clarification_request", "out_of_scope_refusal"):
+            bad.append("retrieval_miss")                  # the index holds what the user did not get
+        else:
+            warn.append("retrieval_miss")
     if at == "answered_partial":
         warn.append("incomplete")
     if v.get("reference_integrity") is False:
@@ -769,11 +978,13 @@ def turn_verdict(v: dict) -> tuple:
         warn.append("user_complaint")
     elif v.get("user_reaction") == "rephrase_same_question":
         warn.append("user_rephrased")
-    return ("bad" if bad else "acceptable" if warn else "good"), bad + warn
+    stages = {REASON_STAGE[r] for r in (bad or warn) if r in REASON_STAGE}
+    source = "retrieval_and_generation" if len(stages) > 1 else next(iter(stages), None)
+    return ("bad" if bad else "acceptable" if warn else "good"), bad + warn, source
 
 # COMMAND ----------
 
-# DBTITLE 1,Judge check and registration — the judge model answers, otherwise fall back to the Databricks-managed judge
+# DBTITLE 1,Judge check and registration — the run stops if the judge model does not answer
 import inspect
 
 JUDGE_MODEL = f"databricks:/{JUDGE_ENDPOINT}" if JUDGE_ENDPOINT else None
@@ -781,24 +992,21 @@ _sample = {"inputs": {"messages": [{"role": "user", "content": "What is the rete
            "outputs": "According to **QP-1457**, inspection records are kept for 10 years."}
 
 
-def _judge_works(model) -> bool:
+if not DRY_RUN:
     try:
-        build_scorers(model)[0][0](**_sample)
-        return True
+        _error = getattr(build_scorers(JUDGE_MODEL)[0][0](**_sample), "error", None)
     except Exception as e:
-        print(f"⚠️ judge model {model or 'Databricks-managed'} failed: {str(e)[:300]}")
-        return False
-
-
-if JUDGE_MODEL and not DRY_RUN and not _judge_works(JUDGE_MODEL):
-    print("   → falling back to the Databricks-managed judge model.")
-    JUDGE_MODEL = None
+        _error = e
+    if _error:
+        raise RuntimeError(f"Judge model {JUDGE_MODEL or 'Databricks-managed'} does not answer (check the endpoint name "
+                           f"in Serving): {str(_error)[:300]}")
 LLM_JUDGES, TRACE_JUDGES, CODE_SCORERS = build_scorers(JUDGE_MODEL)
 SCORERS = LLM_JUDGES + TRACE_JUDGES + CODE_SCORERS
 
 # Fingerprint of everything that determines a score: scorers, judge model, verdict rules, excerpts, history window
-JUDGE_CONFIG_ID = scorers_config_id(SCORERS, JUDGE_MODEL, inspect.getsource(turn_verdict),
-                                    inspect.getsource(evidence_queries), EXCERPTS_PER_QUERY, CHAT_HISTORY_LIMIT)
+JUDGE_CONFIG_ID = scorers_config_id(SCORERS, JUDGE_MODEL, inspect.getsource(turn_verdict), json.dumps(REASON_STAGE),
+                                    inspect.getsource(retrieved_passages), inspect.getsource(evidence_queries),
+                                    EXCERPTS_PER_QUERY, CORPUS_SEARCH_RESULTS, CHAT_HISTORY_LIMIT)
 print(f"Judge model: {JUDGE_MODEL or 'Databricks-managed'} · {len(SCORERS)} scorers · judge_config_id={JUDGE_CONFIG_ID}")
 if not DRY_RUN:
     publish_scorers(SCORERS, EXPERIMENT_ID, JUDGE_CONFIG_ID)
@@ -882,7 +1090,7 @@ print(f"{len(pdf_pairs)} assistant turn(s) to score (cap {cap}).")
 
 # COMMAND ----------
 
-# DBTITLE 1,Replayed turns — evaluation records and the traced replay (answer + cited document excerpts)
+# DBTITLE 1,Replayed turns — evaluation records and the traced replay (answer, what the assistant retrieved, index search)
 
 def to_messages(prior) -> list:
     """COLLECT_LIST(STRUCT(...)) comes back as dicts or Rows depending on the Spark Connect path."""
@@ -938,6 +1146,29 @@ for _, row in pdf_pairs.iterrows():
     }
 RECORDS = {mid: {"inputs": {"messages": t["thread"], "message_id": mid}} for mid, t in TURNS.items()}
 TRACE_IDS = {}                          # message_id → scoring trace id
+ASSISTANT_TRACES = {}                   # trace_id of chat_messages → (assistant trace or None, error)
+
+
+def assistant_trace(trace_id) -> tuple:
+    """(the assistant's own MLflow trace of a turn, error): looked up by the trace_id stored in chat_messages, as is and
+    in the MLflow form tr-<32 hex>."""
+    raw = str(trace_id or "").strip()
+    if not raw:
+        return None, "no trace id in chat_messages"
+    if raw not in ASSISTANT_TRACES:
+        errors = []
+        for candidate in dict.fromkeys([raw, raw if raw.startswith("tr-") else f"tr-{raw.replace('-', '')}"]):
+            try:
+                found = mlflow.get_trace(candidate)
+            except Exception as e:
+                found = None
+                errors.append(f"{candidate}: {str(e)[:150]}")
+            if found is not None:
+                ASSISTANT_TRACES[raw] = (found, None)
+                break
+        else:
+            ASSISTANT_TRACES[raw] = (None, " | ".join(errors) or f"{raw}: trace not found")
+    return ASSISTANT_TRACES[raw]
 
 
 @mlflow.trace(name="qualibot_turn", span_type="AGENT")
@@ -953,19 +1184,56 @@ def replay_turn(messages, message_id):
               "judge_config_id": JUDGE_CONFIG_ID,
               "safety_sample": str(in_sample(message_id, SAFETY_SAMPLE_RATE, "safety")).lower()},
         metadata={"mlflow.trace.session": str(row["session_id"])})
+    kt, kt_error = assistant_trace(row.get("trace_id"))
+    steps, passages = retrieved_passages(kt) if kt is not None else (0, [])
     context = {"source_refs": t["source_refs"], "cited_refs": t["cited_refs"],
-               "next_user_message": t["next_user_message"], "retrieval_error": None}
+               "next_user_message": t["next_user_message"], "retrieval_error": None,
+               "assistant_trace_error": kt_error, "assistant_retrieval_steps": steps}
     docs = []
-    if t["evidence_queries"]:
-        try:
+    try:
+        # Evidence: what the assistant retrieved; excerpts of the cited documents only when its trace does not show it
+        if steps:
+            context["evidence_source"] = "assistant_retrieval"
+            docs = passages
+            record_assistant_retrieval(kt.info.trace_id, passages)
+            if REFS_BY_BASE:
+                corpus_search(search_query(t["thread"]))
+        elif t["evidence_queries"]:
+            context["evidence_source"] = "cited_document_excerpts"
             docs = cited_document_excerpts(t["evidence_queries"])
-        except Exception as e:
-            context["retrieval_error"] = str(e)[:500]
+        else:
+            context["evidence_source"] = "none"
+    except Exception as e:
+        context["retrieval_error"] = str(e)[:500]
     classes = classify_refs(t["cited_refs"], "\n".join(d.page_content for d in docs))
-    record_answer_context({**context, "excerpt_refs": sorted({d.metadata["doc_uri"] for d in docs}),
-                           "excerpt_count": len(docs), "excerpt_chars": sum(len(d.page_content) for d in docs),
+    record_answer_context({**context, "evidence_refs": sorted({d.metadata["doc_uri"] for d in docs}),
+                           "evidence_count": len(docs), "evidence_chars": sum(len(d.page_content) for d in docs),
                            **{f"{k}_refs": v for k, v in classes.items()}})
     return t["answer"]
+
+# COMMAND ----------
+
+# DBTITLE 1,Assistant traces — the passages the assistant retrieved, read from its own trace (sample check)
+# The judges compare each answer with the passages the assistant retrieved. They are read from the assistant's MLflow
+# trace (trace_id of chat_messages); when a trace shows no retrieval step, its span structure is printed below and the
+# judges fall back on excerpts of the cited documents.
+_sampled_trace_ids = [t["row"].get("trace_id") for t in TURNS.values() if _text(t["row"].get("trace_id"))][:5]
+for tid in _sampled_trace_ids:
+    kt, error = assistant_trace(tid)
+    if kt is None:
+        print(f"✗ {tid}: {error}")
+        continue
+    steps, passages = retrieved_passages(kt)
+    print(f"✓ {tid} → {kt.info.trace_id}: {steps} retrieval step(s), {len(passages)} passage(s)"
+          + (f", first from {passages[0].metadata['doc_uri']}" if passages else ""))
+    if not steps:
+        for span in trace_spans(kt):
+            out = span["outputs"]
+            first = out[0] if isinstance(out, list) and out else out
+            keys = sorted(first)[:8] if isinstance(first, dict) else type(first).__name__
+            print(f"    {span['type'] or '-':10} {str(span['name'])[:60]:60} outputs: {type(out).__name__} {keys}")
+if not _sampled_trace_ids:
+    print("No turn with a trace_id: the judges read excerpts of the cited documents.")
 
 # COMMAND ----------
 
@@ -977,19 +1245,25 @@ USER_SOURCE = AssessmentSource(source_type=AssessmentSourceType.HUMAN, source_id
 REQUIRED = {"answer_type", "relevance", "question_intent"}      # without them the verdict is not meaningful
 
 
-def estimated_usage(t: dict, excerpt_chars=None) -> tuple:
-    """(judge calls, input tokens, output tokens) of one turn, from the prompt sizes. Before the excerpts are retrieved,
-    their size is taken as EXCERPTS_PER_QUERY distinct chunks per query (an upper bound)."""
-    if excerpt_chars is None:
-        excerpt_chars = sum(map(len, t["evidence_queries"].values())) * EXCERPTS_PER_QUERY * CHUNK_CHARS
-    exchange = JUDGE_INSTRUCTIONS_CHARS + len(t["question"]) + len(t["answer"])
-    conversation = JUDGE_INSTRUCTIONS_CHARS + len(json.dumps(t["thread"], ensure_ascii=False)) + len(t["answer"])
-    retrieval = 2 if t["evidence_queries"] else 0
+def estimated_usage(t: dict) -> tuple:
+    """(judge calls, input tokens, output tokens) of one turn, estimated from the prompt sizes before it is scored (dry
+    run, batch planning). The evidence is taken as the chunks of every search of the turn (an upper bound)."""
+    searches = max(sum(map(len, t["evidence_queries"].values())) * EXCERPTS_PER_QUERY, CORPUS_SEARCH_RESULTS)
+    evidence_chars = searches * CHUNK_CHARS
+    exchange = JUDGE_INSTRUCTIONS_CHARS + len(json.dumps(t["thread"], ensure_ascii=False)) + len(t["answer"])
+    evidence_judges = 4.5 if t["evidence_queries"] or t["row"].get("trace_id") else 1    # incl. compliance_claim
     reaction = 1 if t["next_user_message"] else 0
-    calls = len(LLM_JUDGES) + retrieval + reaction + SAFETY_SAMPLE_RATE
-    chars = (len(LLM_JUDGES) * conversation + retrieval * (exchange + excerpt_chars)
-             + reaction * (exchange + len(t["next_user_message"] or "")) + SAFETY_SAMPLE_RATE * exchange)
+    calls = len(LLM_JUDGES) + evidence_judges + reaction + SAFETY_SAMPLE_RATE
+    chars = ((len(LLM_JUDGES) + reaction + SAFETY_SAMPLE_RATE) * exchange
+             + evidence_judges * (exchange + evidence_chars))
     return calls, chars / CHARS_PER_TOKEN, calls * OUTPUT_TOKENS_PER_JUDGE_CALL
+
+
+def measured_usage(assessments: list) -> tuple:
+    """(judge calls, input tokens, output tokens) of a scored turn, as reported by the judge model."""
+    judged = [a for a in assessments if a["source_type"] == "LLM_JUDGE"]
+    return (len(judged), sum(a.get("input_tokens") or 0 for a in judged),
+            sum(a.get("output_tokens") or 0 for a in judged))
 
 
 def cost_usd(tokens_in, tokens_out) -> float:
@@ -1016,11 +1290,13 @@ def build_record(mid: str) -> dict:
         errors.append("turn not scored")
     if context.get("retrieval_error"):
         errors.append(f"vector_search: {context['retrieval_error']}")
-    verdict, reasons = turn_verdict(v) if REQUIRED <= set(v) else (None, ["judge_failed"])
+    verdict, reasons, stage = turn_verdict(v) if REQUIRED <= set(v) else (None, ["judge_failed"], None)
     vote = _text(row.get("feedback_vote"))
     disagreement = (verdict == "good" and vote == "down") or (verdict == "bad" and vote == "up")
     review = bool(verdict) and bool(disagreement or in_calibration_sample(mid))
-    calls, t_in, t_out = estimated_usage(t, context.get("excerpt_chars") or 0)
+    calls, t_in, t_out = measured_usage(res["assessments"])
+    if not t_in:
+        calls, t_in, t_out = estimated_usage(t)
     ground = v.get("groundedness")
     return {
         "message_id": row["message_id"], "created_at": row["created_at"], "session_id": row["session_id"],
@@ -1029,7 +1305,10 @@ def build_record(mid: str) -> dict:
         "user_question": t["question"], "thread_turn_count": len(t["thread"]), "answer": t["answer"],
         "next_user_message": t["next_user_message"],
         "citation_count": len(t["source_refs"]), "source_refs": t["source_refs"], "cited_refs": t["cited_refs"],
-        "excerpt_refs": context.get("excerpt_refs") or [], "excerpt_count": context.get("excerpt_count"),
+        "evidence_source": context.get("evidence_source"), "evidence_refs": context.get("evidence_refs") or [],
+        "evidence_count": context.get("evidence_count"),
+        "assistant_retrieval_steps": context.get("assistant_retrieval_steps"),
+        "assistant_trace_error": context.get("assistant_trace_error"),
         "approximate_refs": context.get("approximate_refs") or [],
         "unindexed_refs": context.get("unindexed_refs") or [],
         "unverified_refs": context.get("unverified_refs") or [],
@@ -1045,18 +1324,21 @@ def build_record(mid: str) -> dict:
         "completeness__value": None if not v.get("answer_type") else v["answer_type"] != "answered_partial",
         "language_match__value": _yes(v.get("language_match")), "language_match__rationale": why.get("language_match"),
         "safety__value": _yes(v.get("safety")), "safety__rationale": why.get("safety"),
-        "grounding_source": "cited_documents" if ground else "none", "groundedness_level": ground,
+        "groundedness_level": ground,
         "groundedness__value": None if ground is None else ground == "supported",
         "groundedness__rationale": why.get("groundedness"),
         "missed_answer": _yes(v.get("missed_answer")), "missed_answer_detail": why.get("missed_answer"),
+        "retrieval_quality": v.get("retrieval_quality"), "retrieval_quality__rationale": why.get("retrieval_quality"),
+        "compliance_claim": v.get("compliance_claim"), "compliance_claim__rationale": why.get("compliance_claim"),
         "next_turn_signal": v.get("user_reaction"), "next_turn_rationale": why.get("user_reaction"),
-        "turn_verdict": verdict, "failure_reasons": reasons,
+        "turn_verdict": verdict, "failure_reasons": reasons, "error_source": stage,
         "needs_human_review": review,
         "review_reason": "judge_vs_user_disagreement" if disagreement and review else "calibration_sample" if review else None,
         "golden_candidate": verdict == "bad" or vote == "down",
         "judge_model": JUDGE_MODEL or "databricks-managed", "judge_config_id": JUDGE_CONFIG_ID,
-        "judge_errors": errors, "n_judge_calls": calls,
-        "estimated_cost_usd": round(cost_usd(t_in, t_out), 6), "scored_at": RUN_TS,
+        "judge_errors": errors, "n_judge_calls": int(round(calls)),
+        "judge_input_tokens": int(t_in), "judge_output_tokens": int(t_out),
+        "judge_cost_usd": round(cost_usd(t_in, t_out), 6), "scored_at": RUN_TS,
     }
 
 
@@ -1073,7 +1355,8 @@ def assessment_records(mid: str, record: dict) -> list:
                       "rationale": record["feedback_comment"]})
     return [{**base, "assessment_name": a["name"], "source_type": a["source_type"],
              "value": a["value"] if isinstance(a["value"], str) or a["value"] is None else json.dumps(a["value"]),
-             "value_numeric": numeric_value(a["name"], a["value"]), "rationale": a["rationale"], "error": a["error"]}
+             "value_numeric": numeric_value(a["name"], a["value"]), "rationale": a["rationale"], "error": a["error"],
+             "judge_input_tokens": a.get("input_tokens"), "judge_output_tokens": a.get("output_tokens")}
             for a in items]
 
 
@@ -1125,8 +1408,12 @@ SCORES_COLUMNS = [
     ("citation_count", I, "Documents listed by the assistant as sources"),
     ("source_refs", A, "Document codes listed by the assistant as sources"),
     ("cited_refs", A, "Document codes cited in the answer text"),
-    ("excerpt_refs", A, "Documents whose excerpts were checked by the retrieval judges"),
-    ("excerpt_count", I, "Excerpts of the cited documents given to the retrieval judges"),
+    ("evidence_source", S, "Evidence read by the judges: assistant_retrieval (passages the assistant retrieved, from its "
+                           "trace), cited_document_excerpts (when its trace shows no retrieval) or none"),
+    ("evidence_refs", A, "Documents of the evidence passages"),
+    ("evidence_count", I, "Evidence passages read by the judges"),
+    ("assistant_retrieval_steps", I, "Retrieval steps found in the assistant's trace (0: trace not found or without them)"),
+    ("assistant_trace_error", S, "Why the assistant's trace could not be read, if so"),
     ("approximate_refs", A, "Cited codes resolved despite a typo (e.g. IN_APO_006 → IN_APO_0006)"),
     ("unindexed_refs", A, "Cited codes absent from the index but mentioned in the excerpts (documents outside the corpus)"),
     ("unverified_refs", A, "Cited codes found neither in the index nor in the excerpts (possibly invented)"),
@@ -1145,24 +1432,32 @@ SCORES_COLUMNS = [
     ("language_match__rationale", S, "Rationale of the language judge"),
     ("safety__value", B, "Judge: no harmful content; NULL outside the 10% safety sample"),
     ("safety__rationale", S, "Rationale of the safety judge"),
-    ("grounding_source", S, "cited_documents when the answer could be checked against excerpts, none otherwise"),
     ("groundedness_level", S, "Judge: supported, partially_supported or not_supported; NULL when nothing could be checked"),
     ("groundedness__value", B, "groundedness_level is supported"),
     ("groundedness__rationale", S, "Rationale of the groundedness judge (names the unsupported claims)"),
     ("missed_answer", B, "Judge: the answer says 'not found' while the cited excerpts contain the information"),
     ("missed_answer_detail", S, "What was missed, according to the judge"),
+    ("retrieval_quality", S, "sufficient: the assistant retrieved what the question needs · retrieval_miss: an independent "
+                             "search of the index finds more · documentation_gap · not_applicable; NULL without the "
+                             "assistant's retrieval"),
+    ("retrieval_quality__rationale", S, "Rationale of the retrieval quality judges"),
+    ("compliance_claim", S, "Compliance questions: evidence_based, unsupported_compliance_claim or not_applicable"),
+    ("compliance_claim__rationale", S, "Rationale of the compliance claim judge"),
     ("next_turn_signal", S, "Judge label of the user's next message: no_next_turn, moves_on, follow_up, rephrase_same_question, correction_or_complaint"),
     ("next_turn_rationale", S, "Rationale of the user reaction judge"),
     ("turn_verdict", S, _VERDICT_DOC),
     ("failure_reasons", A, "Reasons of a bad or acceptable verdict (unsupported_claims, missed_answer_in_sources, …)"),
+    ("error_source", S, "Stage at fault: retrieval, generation or retrieval_and_generation; NULL for a good verdict"),
     ("needs_human_review", B, "In the human review queue (judge/user disagreement or calibration sample)"),
     ("review_reason", S, "judge_vs_user_disagreement or calibration_sample"),
     ("golden_candidate", B, "Bad verdict or down vote: candidate case for the golden dataset"),
     ("judge_model", S, "Judge model used"),
     ("judge_config_id", S, "Fingerprint of the scorers, judge model and verdict rules; compare scores of the same configuration"),
     ("judge_errors", A, "Scorer errors of the turn"),
-    ("n_judge_calls", I, "Judge model calls made for the turn"),
-    ("estimated_cost_usd", D, "Estimated judge cost of the turn (USD)"),
+    ("n_judge_calls", I, "LLM judge assessments of the turn"),
+    ("judge_input_tokens", I, "Input tokens of the judge calls, as reported by the judge model (estimated if not)"),
+    ("judge_output_tokens", I, "Output tokens of the judge calls, as reported by the judge model (estimated if not)"),
+    ("judge_cost_usd", D, "Judge cost of the turn (USD), from its tokens"),
     ("scored_at", S, "Start time (UTC) of the scoring run"),
 ]
 SCORES_SCHEMA = StructType([StructField(n, t) for n, t, _ in SCORES_COLUMNS])
@@ -1183,6 +1478,8 @@ ASSESSMENTS_COLUMNS = [
     ("value_numeric", D, "Numeric form: 1 = pass, 0 = fail, 0.5 = partial; counts as is; NULL for labels"),
     ("rationale", S, "Rationale of the scorer"),
     ("error", S, "Error message when the scorer failed"),
+    ("judge_input_tokens", I, "Input tokens of the judge call(s), as reported by the judge model"),
+    ("judge_output_tokens", I, "Output tokens of the judge call(s), as reported by the judge model"),
 ]
 ASSESSMENTS_SCHEMA = StructType([StructField(n, t) for n, t, _ in ASSESSMENTS_COLUMNS])
 ASSESSMENTS_DOCS = {n: d for n, _, d in ASSESSMENTS_COLUMNS}
@@ -1193,15 +1490,19 @@ RUNS_COLUMNS = [
     ("judge_model", S, "Judge model used"),
     ("judge_config_id", S, "Fingerprint of the scorers, judge model and verdict rules"),
     ("n_messages", I, "Turns scored"),
-    ("n_judge_calls", I, "Judge model calls"),
-    ("estimated_cost_usd", D, "Estimated judge cost (USD)"),
+    ("n_judge_calls", I, "LLM judge assessments"),
+    ("judge_input_tokens", I, "Input tokens of the judge calls"),
+    ("judge_output_tokens", I, "Output tokens of the judge calls"),
+    ("judge_cost_usd", D, "Judge cost (USD), from the tokens"),
     ("duration_s", D, "Duration of the run (seconds)"),
     ("n_judge_errors", I, "Turns with at least one scorer error"),
     ("good_rate", D, "Share of good verdicts"),
     ("bad_rate", D, "Share of bad verdicts"),
     ("refusal_rate", D, "Share of not_found and out_of_scope_refusal answers"),
     ("groundedness_rate", D, "Share of supported answers among those checked against excerpts"),
-    ("grounding_coverage", D, "Share of answers checked against excerpts"),
+    ("grounding_coverage", D, "Share of answers checked against evidence"),
+    ("assistant_retrieval_coverage", D, "Share of turns whose evidence is the assistant's own retrieval"),
+    ("retrieval_miss_rate", D, "Share of retrieval_miss among the turns whose retrieval quality was judged"),
     ("judge_user_agreement", D, "Agreement between the verdict (bad / not bad) and the user votes"),
     ("n_voted", I, "Scored turns with a user vote"),
     ("n_needs_human_review", I, "Turns added to the human review queue"),
@@ -1248,13 +1549,17 @@ def write_run(df: pd.DataFrame, n_left: int) -> dict:
         "run_ts": RUN_TS, "mlflow_run_id": MLFLOW_RUN_ID, "judge_model": JUDGE_MODEL or "databricks-managed",
         "judge_config_id": JUDGE_CONFIG_ID, "n_messages": int(len(df)),
         "n_judge_calls": int(df["n_judge_calls"].sum()),
-        "estimated_cost_usd": round(float(df["estimated_cost_usd"].sum()), 6),
+        "judge_input_tokens": int(df["judge_input_tokens"].sum()), "judge_output_tokens": int(df["judge_output_tokens"].sum()),
+        "judge_cost_usd": round(float(df["judge_cost_usd"].sum()), 6),
         "duration_s": round(time.time() - t_start, 1),
         "n_judge_errors": int((df["judge_errors"].map(len) > 0).sum()),
         "good_rate": rate(df["turn_verdict"], "good"), "bad_rate": rate(df["turn_verdict"], "bad"),
         "refusal_rate": rate(df["answer_type"].isin(["not_found", "out_of_scope_refusal"]).where(df["answer_type"].notna())),
         "groundedness_rate": rate(df["groundedness__value"]),
-        "grounding_coverage": rate(df["grounding_source"] == "cited_documents"),
+        "grounding_coverage": rate(df["groundedness_level"].notna()),
+        "assistant_retrieval_coverage": rate(df["evidence_source"] == "assistant_retrieval"),
+        "retrieval_miss_rate": rate(df["retrieval_quality"].where(df["retrieval_quality"].isin(
+            ["sufficient", "retrieval_miss", "documentation_gap"])), "retrieval_miss"),
         "judge_user_agreement": agree, "n_voted": int(len(voted)),
         "n_needs_human_review": int(df["needs_human_review"].sum()), "n_turns_left": int(n_left),
     }
@@ -1264,15 +1569,16 @@ def write_run(df: pd.DataFrame, n_left: int) -> dict:
 # COMMAND ----------
 
 # DBTITLE 1,Run — batches of turns scored with mlflow.genai.evaluate, paced on the judge model's rate limits
-# Each batch holds about one minute of this job's share of the judge model's token limits; its scores are written to
-# the tables before the next batch starts, so an interrupted run keeps what it scored. No batch starts after
-# max_run_minutes: the turns left are scored by the next run.
+# Each batch holds about one minute of this job's share of the judge model's token limits, estimated from the prompt
+# sizes and corrected by the tokens the judge model reports. Its scores are written before the next batch starts, so
+# an interrupted run keeps what it scored. No batch starts after max_run_minutes: the turns left go to the next run.
 from datetime import datetime, timezone
 
 RUN_TS = datetime.now(timezone.utc).isoformat(timespec="seconds")
 t_start = time.time()
 MLFLOW_RUN_ID = None
 results, records, assessment_rows, run_row = {}, [], [], None
+calibration = [1.0, 1.0]               # measured / estimated tokens (input, output), updated after each batch
 TOKENS_IN_PER_MINUTE = JUDGE_INPUT_TOKENS_PER_MINUTE * JUDGE_RATE_SHARE
 TOKENS_OUT_PER_MINUTE = JUDGE_OUTPUT_TOKENS_PER_MINUTE * JUDGE_RATE_SHARE
 
@@ -1283,10 +1589,11 @@ def minutes_of_limits(usage: list) -> float:
 
 
 def next_batch(pending: list) -> list:
-    """First pending turns whose estimated judge usage fits in one minute of the limits (at least one turn)."""
+    """First pending turns whose calibrated judge usage fits in one minute of the limits (at least one turn)."""
     batch, usage = [], []
     for mid in pending:
-        usage.append(estimated_usage(TURNS[mid]))
+        calls, t_in, t_out = estimated_usage(TURNS[mid])
+        usage.append((calls, t_in * calibration[0], t_out * calibration[1]))
         if batch and minutes_of_limits(usage) > 1:
             break
         batch.append(mid)
@@ -1302,11 +1609,10 @@ if not TURNS:
 elif DRY_RUN:
     usage = [estimated_usage(t) for t in TURNS.values()]
     calls, t_in, t_out = (sum(u[i] for u in usage) for i in range(3))
-    n_queries = sum(len(q) for t in TURNS.values() for q in t["evidence_queries"].values())
     print(f"DRY RUN (nothing is scored or written) · {len(TURNS)} turns · ~{calls:.0f} judge calls "
-          f"({calls / len(TURNS):.1f} per turn) · {n_queries} excerpt searches · at most ~{t_in / 1e6:.2f}M in / "
-          f"~{t_out / 1e6:.2f}M out tokens · at most ≈ ${cost_usd(t_in, t_out):.2f} · at least "
-          f"{minutes_of_limits(usage):.0f} min of judge rate limits (budget per run: {MAX_RUN_MINUTES:.0f} min)")
+          f"({calls / len(TURNS):.1f} per turn) · at most ~{t_in / 1e6:.2f}M in / ~{t_out / 1e6:.2f}M out tokens · "
+          f"at most ≈ ${cost_usd(t_in, t_out):.2f} · at most {minutes_of_limits(usage):.0f} min of judge rate limits "
+          f"(budget per run: {MAX_RUN_MINUTES:.0f} min)")
 else:
     pending, pace = list(TURNS), 1.0
     with mlflow.start_run(run_name=f"quality-scoring {RUN_TS}") as run:
@@ -1324,12 +1630,17 @@ else:
             records += rows
             assessment_rows += a_rows
             run_row = write_run(pd.DataFrame(records), len(pending))
-            # Pacing: the batch must last as long as its measured usage takes of the limits; slower after a rejection
+            # Pacing: the batch lasts as long as its measured usage takes of the limits; slower after a rejection
             pace = min(pace * 1.5, 4.0) if rate_limited(a_rows) else max(1.0, pace / 1.2)
-            used = minutes_of_limits([estimated_usage(TURNS[mid], results.get(mid, {}).get("context", {}).get("excerpt_chars") or 0)
-                                      for mid in batch])
-            print(f"{len(records)}/{len(TURNS)} turns scored · {time.time() - t_start:.0f} s")
-            wait = used * 60 * pace - (time.time() - b_start)
+            batch_usage = [(r["n_judge_calls"], r["judge_input_tokens"], r["judge_output_tokens"]) for r in rows]
+            estimated = [estimated_usage(TURNS[mid]) for mid in batch]
+            for i in (0, 1):
+                measured, planned = sum(u[i + 1] for u in batch_usage), sum(e[i + 1] for e in estimated)
+                if measured and planned:
+                    calibration[i] = 0.5 * calibration[i] + 0.5 * measured / planned
+            print(f"{len(records)}/{len(TURNS)} turns scored · {time.time() - t_start:.0f} s · batch of {len(batch)}: "
+                  f"{sum(u[1] for u in batch_usage):,} in / {sum(u[2] for u in batch_usage):,} out tokens")
+            wait = minutes_of_limits(batch_usage) * 60 * pace - (time.time() - b_start)
             if pending and wait > 0:
                 time.sleep(wait)
     left = f" · {len(pending)} turn(s) left for the next run (time budget reached)" if pending else ""
@@ -1339,8 +1650,12 @@ df_final = pd.DataFrame(records)
 if len(df_final):
     print("Verdicts:", df_final["turn_verdict"].value_counts(dropna=False).to_dict())
     print("Answer types:", df_final["answer_type"].value_counts(dropna=False).to_dict())
+    print("Evidence:", df_final["evidence_source"].value_counts(dropna=False).to_dict(),
+          "· retrieval quality:", df_final["retrieval_quality"].value_counts(dropna=False).to_dict(),
+          "· stage at fault:", df_final["error_source"].value_counts(dropna=False).to_dict())
     print(f"{int(df_final['n_judge_calls'].sum())} judge calls ({df_final['n_judge_calls'].mean():.1f} per turn) · "
-          f"estimated cost ${df_final['estimated_cost_usd'].sum():.3f} · "
+          f"{int(df_final['judge_input_tokens'].sum()):,} in / {int(df_final['judge_output_tokens'].sum()):,} out tokens · "
+          f"cost ${df_final['judge_cost_usd'].sum():.3f} · "
           f"{int((df_final['judge_errors'].map(len) > 0).sum())} turn(s) with scorer errors")
     print(f"✓ {len(records)} rows → {SCORES_TABLE} · {len(assessment_rows)} rows → {ASSESSMENTS_TABLE} · "
           f"1 row → {SCORING_RUNS_TABLE}")
@@ -1380,14 +1695,16 @@ if run_row:
                             if isinstance(v, (int, float)) and not isinstance(v, bool) and v is not None})
         reasons = df_final.explode("failure_reasons")["failure_reasons"].value_counts()
         mlflow.log_metrics({f"reason/{k}": int(v) for k, v in reasons.items() if isinstance(k, str)})
+        mlflow.log_metrics({f"error_source/{k}": int(v) for k, v in df_final["error_source"].value_counts().items()})
         by_agent = df_final.groupby("endpoint_name")["turn_verdict"].apply(lambda s: float((s == "bad").mean()))
         mlflow.log_metrics({f"bad_rate/{k}": v for k, v in by_agent.items()})
         worst = df_final[df_final["turn_verdict"] == "bad"].head(50)
         if len(worst):
             mlflow.log_table(worst[["message_id", "endpoint_name", "question_intent", "user_question", "answer",
-                                    "failure_reasons", "groundedness__rationale", "missed_answer_detail",
+                                    "failure_reasons", "error_source", "evidence_source", "groundedness__rationale",
+                                    "missed_answer_detail", "retrieval_quality__rationale",
                                     "feedback_vote", "scoring_trace_id"]].astype(str), "worst_turns.json")
-    print(f"✓ MLflow run {MLFLOW_RUN_ID}: metrics run/*, reason/*, bad_rate/*, artifact worst_turns.json")
+    print(f"✓ MLflow run {MLFLOW_RUN_ID}: metrics run/*, reason/*, error_source/*, bad_rate/*, artifact worst_turns.json")
 
 if FEEDBACK_TO_AGENT_TRACES and len(df_final):
     src = AssessmentSource(source_type=AssessmentSourceType.LLM_JUDGE, source_id=f"qualibot-quality-scoring/{JUDGE_CONFIG_ID}")
@@ -1403,6 +1720,16 @@ if FEEDBACK_TO_AGENT_TRACES and len(df_final):
 
 if FAIL_ON_ALERT and alerts:
     raise RuntimeError("Quality alert: " + " | ".join(alerts))
+
+# COMMAND ----------
+
+# DBTITLE 1,Output schema — the dashboard reads the tables: views over the quality outputs are dropped
+QUALITY_VIEW_PREFIXES = ("v_chat_quality_", "v_ka_eval_", "v_quality_shared_scorers")
+if not DRY_RUN:
+    for r in spark.sql(f"SHOW VIEWS IN {OUTPUT_SCHEMA}").collect():
+        if r["viewName"].startswith(QUALITY_VIEW_PREFIXES) and not r["isTemporary"]:
+            spark.sql(f"DROP VIEW IF EXISTS {OUTPUT_SCHEMA}.{r['viewName']}")
+            print(f"View dropped: {OUTPUT_SCHEMA}.{r['viewName']}")
 
 # COMMAND ----------
 

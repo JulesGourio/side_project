@@ -6,37 +6,54 @@ Working conventions, environment and project status: see `CLAUDE.md`.
 | Notebook | MLflow experiment | What it shows |
 |---|---|---|
 | `Build_Golden_Dataset.py` | evaluation experiment (Datasets tab) | the golden dataset `uat_landingzone.qualibot.qualibot_eval_golden` (20-30 reviewed cases) |
-| `Evaluate_Knowledge_Assistant.py` | `.../qualibot-traces/trace_eval_all_v2` (traces in Unity Catalog) | one run per evaluation, one trace per case, 10 LLM judges and 3 code scorers registered, the golden dataset linked to every run |
-| `Score_Production_QA.py` (job D_3) | `/Shared/qualibot-quality-scoring` | one run per scoring run, one trace per production turn, 8 LLM judges and 2 code scorers registered (about 6 judge calls per turn, about 3 turns per minute) |
+| `Evaluate_Knowledge_Assistant.py` | `.../qualibot-traces/trace_eval_all_v2` (traces in Unity Catalog) | one run per evaluation, one trace per case (with the passages the assistant retrieved), 12 LLM judges and 3 code scorers registered, the golden dataset linked to every run |
+| `Score_Production_QA.py` (job D_3) | `/Shared/qualibot-quality-scoring` | one run per scoring run, one trace per production turn (with the assistant's retrieved passages), 10 LLM judges and 2 code scorers registered (about 8 judge calls per turn) |
 | `Load_Test_Knowledge_Assistant.py` | `/Shared/qualibot-load-tests` | one run per load test: HTTP 429 and silent retrieval failures (answers without documents) per concurrency level |
 | `Migrate_KA_Traces_To_UC.py` (job D_2) | `.../qualibot-traces/trace_ka_*` | the assistants' own traces, copied to Unity Catalog |
 
-The scorers `relevance`, `language_match`, `groundedness`, `missed_answer` and `reference_integrity` are identical in
-the evaluation and the production monitoring (shared cell of both notebooks), so their results can be compared.
+The scorers `relevance`, `language_match`, `groundedness`, `missed_answer`, `retrieval_quality`, `compliance_claim` and
+`reference_integrity` are identical in the evaluation and the production monitoring (shared cell of both notebooks), so
+their results can be compared.
 
-## Evidence read by the retrieval judges
+## Evidence read by the judges
 
-`groundedness`, `missed_answer` and `retrieval_sufficiency` read the `RETRIEVER` step `cited_document_excerpts`:
+The assistants query the `qualibot` index (`chunks_index_v1`). The judges compare each answer with what the assistant
+retrieved, and separate retrieval errors from generation errors.
 
-1. Documents: every document the answer relies on, i.e. the assistant's sources (production: `sources_json`;
-   evaluation: the citations of the response) and the codes written in the answer, when they exist in the index.
-   No limit on their number.
-2. Searches, for each document: the question; each line of the answer that cites the document (`⟦n⟧` marker whose
-   number is the document's `n` in `sources_json`, footnote pointing to it, or its code written in the line); each
-   passage the assistant quoted from it (`#:~:text=` fragment of a citation link, footnote text).
-3. Each search is a hybrid Vector Search query restricted to the document and its language variants; the 3 best
-   chunks are kept (`EXCERPTS_PER_QUERY`), duplicates removed, untruncated.
+1. **The assistant's retrieval** (`RETRIEVER` step `assistant_retrieval`): the passages returned by the retrieval steps
+   of the assistant's own MLflow trace, all of them, untruncated. Production reads the trace by the `trace_id` of
+   `chat_messages` (as is, then as `tr-<32 hex>`); the evaluation asks the endpoint to return its trace
+   (`databricks_options.return_trace`). A sample check cell of the scoring notebook prints, for 5 turns, the trace
+   found and its retrieval steps, or its span structure when no retrieval step is recognised.
+2. **Fallback** (`RETRIEVER` step `cited_document_excerpts`), only when the trace shows no retrieval step: excerpts of
+   every document the answer relies on (its sources and the codes it writes), each searched with the question, each
+   answer line citing it (`⟦n⟧` marker = `n` of `sources_json`, footnote, or its code) and each passage the assistant
+   quoted from it (`#:~:text=` fragment, footnote); 3 chunks per search, duplicates removed. These excerpts are a
+   subset of the documents: a claim absent from them is "not verifiable", not "not supported".
+3. **Independent search** (`corpus_search`): the question (preceded by the previous one for a short follow-up) searched
+   in the whole index, 10 chunks. Read by `retrieval_quality` only.
 
-The chunks come from the index `chunks_index_v1`: they are re-retrieved, not the passages the assistant itself read
-(its traces do not expose them). A claim the chunks do not cover is "not verifiable", not "not supported".
+What each judge decides:
 
-## Judge model rate limits
+| Judge | Reads | Decides |
+|---|---|---|
+| `groundedness` | conversation, evidence, answer | every claim is stated by the passages the assistant retrieved (a claim they do not state was not taken from the documentation) |
+| `missed_answer` | conversation, evidence, answer | the answer says "not found", or leaves a part out, while the passages contain it |
+| `retrieval_quality` | conversation, the assistant's passages, then the independent search | `sufficient`; `retrieval_miss` (the index holds more than the assistant retrieved); `documentation_gap`; `not_applicable` |
+| `compliance_claim` | conversation, evidence, answer | on compliance questions, compliance is concluded only as far as the passages establish it |
 
-The judge model (`databricks-gpt-5-6-luna`) allows 200,000 input and 20,000 output tokens per minute (1,000 requests
-per second, 360,000 per hour). Both notebooks use 70% of the token limits (`JUDGE_RATE_SHARE`) and retry a rejected
-call for about 2 minutes (`JUDGE_MAX_RETRIES`). The production scoring works in batches of about one minute of that
-budget, writes each batch, and stops starting batches after `max_run_minutes`; the evaluation sets MLflow's scorer
-rate limit (`MLFLOW_GENAI_EVAL_SCORER_RATE_LIMIT`) from the same budget.
+The turn verdict gives the stage at fault, `error_source`: `retrieval` (retrieval_miss) or `generation` (unsupported
+claims or compliance, information the assistant had but left out, wrongful refusal…).
+
+## Judge model
+
+`databricks-gpt-6-luna`: 1.4 DBU per million input tokens, 7.1 per million output tokens; 200,000 input and 20,000
+output tokens per minute (1,000 requests per second, 360,000 per hour). Both notebooks use 70% of the token limits
+(`JUDGE_RATE_SHARE`) and retry a rejected call for about 2 minutes (`JUDGE_MAX_RETRIES`); a run stops if the endpoint
+does not answer. Costs and pacing use the tokens the judge model reports for each call (`judge_input_tokens`,
+`judge_output_tokens` in the tables). The production scoring works in batches of about one minute of that budget,
+writes each batch, and stops starting batches after `max_run_minutes`; the evaluation sets MLflow's scorer rate limit
+(`MLFLOW_GENAI_EVAL_SCORER_RATE_LIMIT`) from the same budget.
 
 ## Deployment (Bitbucket Pipelines)
 
@@ -52,7 +69,7 @@ missed); labels have no numeric form. Evaluation rows carry their run's start ti
 
 | Object | Grain | Written by | Typical use |
 |---|---|---|---|
-| `chat_quality_scores` | assistant turn | production scoring (D_3) | KPIs by day, assistant and division (`turn_verdict`, `groundedness_level`, `answer_type`, votes, cost); failure reasons (`failure_reasons`); review queue (`needs_human_review`, `golden_candidate`); turn drill-down |
+| `chat_quality_scores` | assistant turn | production scoring (D_3) | KPIs by day, assistant and division (`turn_verdict`, `groundedness_level`, `answer_type`, votes, cost); failure reasons (`failure_reasons`) and stage at fault (`error_source`: retrieval or generation); evidence (`evidence_source`, `retrieval_quality`); review queue (`needs_human_review`, `golden_candidate`); turn drill-down |
 | `chat_quality_assessments` | turn × scorer | production scoring | any scorer or label over time without schema change (`value`, `value_numeric`, `rationale`, `error`); shared scorers compared with `ka_eval_assessments` |
 | `chat_quality_scoring_runs` | scoring run | production scoring | volumes, rates, estimated cost, judge/user agreement, turns left for the next run |
 | `ka_eval_runs` | evaluation run | evaluation notebook | run context: endpoint, subset, judge model, scorer configuration |

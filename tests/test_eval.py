@@ -27,7 +27,8 @@ ds.merge_records([
 
 def decide(name, text):
     return {"fact_coverage": "full", "fact_contradiction": "no_contradiction", "refusal_handling": "not_applicable",
-            "groundedness": "partially_supported", "missed_answer": "no"}.get(name, "yes")
+            "groundedness": "partially_supported", "missed_answer": "no", "compliance_claim": "not_applicable",
+            "retrieval_quality": "full"}.get(name, "yes")
 calls = fake_judges(decide)
 
 def ka(method, path, body=None):
@@ -40,13 +41,20 @@ def ka(method, path, body=None):
     else:
         text = "Voir **PRLAT549.FR** : outil GDC."
         url = "https://intraqual.lat.corp/intraqual_prod/identification.aspx?ref=PRLAT549.FR#:~:text=outil%20GDC%20de%20gestion%20des%20comp%C3%A9tences"
-    return {"output": [{"type": "message", "content": [{"type": "output_text", "text": text,
-            "annotations": [{"type": "url_citation", "title": url, "url": url}]}]}]}
+    response = {"output": [{"type": "message", "content": [{"type": "output_text", "text": text,
+                "annotations": [{"type": "url_citation", "title": url, "url": url}]}]}]}
+    if "APO" in q and "databricks_options" in body:      # this assistant returns its trace, with its retrieval step
+        docs = [{"page_content": "[Source: IN_APO_0006 | Title: Glossary] APO: Analyste Performance Opérationnelle.",
+                 "metadata": {"doc_uri": "IN_APO_0006"}}]
+        response["databricks_output"] = {"trace": {"info": {"trace_id": "tr-ka-apo"}, "data": {"spans": [
+            {"name": "retrieve", "attributes": {"mlflow.spanType": '"RETRIEVER"', "mlflow.spanOutputs": json.dumps(docs)}}]}}}
+    return response
 w = MagicMock()
 w.api_client.do.side_effect = ka
 w.vector_search_indexes.get_index.return_value.delta_sync_index_spec.source_table = "uat_landingzone.qualibot.chunks_v1"
 w.vector_search_indexes.query_index.side_effect = lambda **kw: VSResult(
-    [[r, f"Excerpt of {r}: APO = Analyste Performance Opérationnelle; GDC tool.", "{}"] for r in json.loads(kw["filters_json"])["REF"]])
+    [[r, f"Excerpt of {r}: APO = Analyste Performance Opérationnelle; GDC tool.", "{}"] for r in json.loads(kw["filters_json"])["REF"]]
+    if kw.get("filters_json") else [["IN_APO_0006", "Corpus chunk: APO glossary.", "{}"]])
 import databricks.sdk
 databricks.sdk.WorkspaceClient = lambda: w
 rt = types.ModuleType("databricks.sdk.runtime")
@@ -88,6 +96,14 @@ for tr in mlflow.search_traces(locations=[ns["EXPERIMENT_ID"]], run_id=ns["RUN_I
     long_tags = {k: len(v) for k, v in (tr.info.tags or {}).items() if not k.startswith("mlflow.") and len(v) > 250}
     assert not long_tags, f"trace tags longer than 250 characters: {long_tags}"
 print("trace tags all within 250 characters: ok")
+r_ = pd.DataFrame(sql.tables["uat_proj.qualibot.ka_eval_results"])
+print(r_[["question", "evidence_source", "evidence_count", "retrieval_quality", "compliance_claim"]].to_string())
+apo = r_[r_.question.str.contains("APO")].iloc[0]
+assert apo["evidence_source"] == "assistant_retrieval" and apo["evidence_count"] == 1 and apo["retrieval_quality"] == 1.0
+assert set(r_[~r_.question.str.contains("APO")]["evidence_source"]) == {"cited_document_excerpts", "none"}
+run_ = pd.DataFrame(sql.tables["uat_proj.qualibot.ka_eval_runs"]).iloc[0]
+assert run_["judge_input_tokens"] > 0 and run_["judge_cost_usd"] > 0
+print("evidence, retrieval quality and judge tokens: ok")
 print(pd.DataFrame(sql.tables["uat_proj.qualibot.ka_eval_metrics"])[["metric", "score", "ci_low", "ci_high", "n"]].to_string())
 r = pd.DataFrame(sql.tables["uat_proj.qualibot.ka_eval_results"])
 print(r[["case_id", "question", "correctness", "groundedness", "reference_integrity", "failed_scorers", "expected_sources"]].to_string())

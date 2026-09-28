@@ -64,7 +64,9 @@ def fake_judges(decide):
         text = prompt if isinstance(prompt, str) else "\n".join(getattr(m, "content", str(m)) for m in prompt)
         calls.append((assessment_name, model_uri))
         return Feedback(name=assessment_name, value=decide(assessment_name, text), rationale=f"fake {assessment_name}",
-                        source=AssessmentSource(source_type="LLM_JUDGE", source_id=str(model_uri)))
+                        source=AssessmentSource(source_type="LLM_JUDGE", source_id=str(model_uri)),
+                        metadata={"mlflow.assessment.judgeInputTokens": len(text) // 4,
+                                  "mlflow.assessment.judgeOutputTokens": 60})
     ij.invoke_judge_model = fake; bj.invoke_judge_model = fake
     return calls
 

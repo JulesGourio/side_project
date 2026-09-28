@@ -93,7 +93,7 @@ VS_COLUMNS = ["REF", "chunk_text", "semantic_headers"]
 REF_SOURCE_TABLE = None                                # source table of the index; None = read from the index
 
 # ── Models and endpoints ──
-JUDGE_MODEL = "databricks-gpt-5-6-luna"
+JUDGE_MODEL = "databricks-gpt-6-luna"
 EMBED_MODEL = "databricks-gte-large-en"                # only used for diversity and de-duplication
 KA_ENDPOINT = "ka-7679a56e-endpoint"                   # qualibot_ALL_v2: the assistant evaluated
 KA_MAX_CONCURRENT = 3                                  # capacity limit of the assistant endpoint
@@ -133,8 +133,8 @@ MIN_REFUSAL_CASES = 2            # expected answer = "not in the documentation" 
 MAX_NEEDS_EXPERT = 3             # low-confidence cases kept for expert review
 
 # ── Cost (pay-per-token, DBU per 1M tokens) ──
-DBU_PER_M_INPUT = 2.857
-DBU_PER_M_OUTPUT = 17.143
+DBU_PER_M_INPUT = 1.4
+DBU_PER_M_OUTPUT = 7.1
 USD_PER_DBU = 0.07
 CHARS_PER_TOKEN = 3.8            # estimate, recalibrated in section 13
 OUTPUT_OVERHEAD = 1.0            # > 1 when the model bills hidden reasoning tokens (calibrated in section 13)

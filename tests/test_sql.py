@@ -36,7 +36,7 @@ for d in dumps:
 assert not any(q.startswith("CREATE OR REPLACE VIEW") for d in dumps for q in d["statements"]), "no view expected"
 DASHBOARD_QUERIES = {
     "daily quality": """SELECT DATE(created_at) AS day, endpoint_name, COUNT(*) AS n,
-                               AVG(IF(turn_verdict = 'bad', 1.0, 0.0)) AS bad_rate, SUM(estimated_cost_usd) AS cost
+                               AVG(IF(turn_verdict = 'bad', 1.0, 0.0)) AS bad_rate, SUM(judge_cost_usd) AS cost, COUNT_IF(error_source = 'retrieval') AS n_retrieval_errors
                         FROM qualibot.chat_quality_scores WHERE turn_verdict IS NOT NULL GROUP BY ALL""",
     "failure reasons": """SELECT reason, COUNT(*) AS n
                           FROM qualibot.chat_quality_scores LATERAL VIEW explode(failure_reasons) r AS reason GROUP BY reason""",

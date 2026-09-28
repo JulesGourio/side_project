@@ -28,6 +28,8 @@ def decide(name, text):
     if name == "groundedness": return "not_supported" if "INVENTED" in text else "supported"
     if name == "missed_answer": return "yes" if "pas trouv" in text else "no"
     if name == "user_reaction": return "correction_or_complaint" if "faux" in text else "no_next_turn"
+    if name == "retrieval_quality": return "none" if "(no passage)" in text else "full"
+    if name == "compliance_claim": return "unsupported_compliance_claim" if "INVENTED" in text else "not_applicable"
     return "yes"
 calls = fake_judges(decide)
 
@@ -74,15 +76,37 @@ class Spark:
         return FakeDF(pdf, columns=["id", "trace_id", "content"])
     def sql(self, q, *a):
         sql.run(q)
+        if q.startswith("SHOW VIEWS"):
+            return types.SimpleNamespace(collect=lambda: [{"viewName": "v_chat_quality_daily", "isTemporary": False},
+                                                          {"viewName": "other_view", "isTemporary": False}])
         if "AS bad_rate" in q and q.lstrip().startswith("SELECT"):
             return FakeDF(pd.DataFrame({"endpoint_name": ["ka-7679a56e-endpoint"] * 5, "day": pd.date_range("2026-09-17", periods=5),
                                         "n": [20, 20, 20, 20, 20], "bad_rate": [0.1, 0.1, 0.1, 0.1, 0.6]}))
         return FakeDF(pdf)
     def createDataFrame(self, rows, schema): return sql.create_df(rows, schema)
 
+# The assistants' own traces: turn 1 shows its retrieval step, turn 4 a retrieval step that returned nothing (the
+# independent search of the index then finds the answer), turn 2 has no trace (excerpts of the cited documents instead)
+class KATrace:
+    def __init__(self, tid, docs):
+        self.info = types.SimpleNamespace(trace_id=tid)
+        self._d = {"info": {}, "data": {"spans": [
+            {"name": "agent", "attributes": {"mlflow.spanType": '"AGENT"', "mlflow.spanOutputs": '"answer"'}},
+            {"name": "vector_search", "attributes": {"mlflow.spanType": '"RETRIEVER"',
+                                                     "mlflow.spanInputs": '{"query": "q"}',
+                                                     "mlflow.spanOutputs": json.dumps(docs)}}]}}
+    def to_dict(self): return self._d
+KA_TRACES = {"tr-1": KATrace("tr-1", [{"page_content": "[Source: QP-1457 | Title: Records] Records are kept 10 years.",
+                                       "metadata": {"doc_uri": "https://x/identification.aspx?ref=QP-1457"}}]),
+             "tr-4": KATrace("tr-4", [])}
+_get_trace = mlflow.get_trace
+mlflow.get_trace = lambda tid, *a, **k: KA_TRACES[tid] if tid in KA_TRACES else _get_trace(tid, *a, **k)
+
 w = MagicMock()
 w.vector_search_indexes.get_index.return_value.delta_sync_index_spec.source_table = "uat_landingzone.qualibot.chunks_v1"
 def query_index(**kw):
+    if not kw.get("filters_json"):                       # independent search of the whole index
+        return VSResult([["PRLAT549_GB", "Corpus chunk: LIS TUN personnel qualification by QCM.", "{}"]])
     refs = json.loads(kw["filters_json"])["REF"]
     return VSResult([[r, f"Excerpt of {r}: records are kept 10 years; operator qualification via QCM.", "{}"] for r in refs])
 w.vector_search_indexes.query_index.side_effect = query_index
@@ -111,6 +135,17 @@ if not DRY:
     print(df[["message_id", "turn_verdict", "failure_reasons", "groundedness_level", "missed_answer", "unverified_refs", "approximate_refs", "judge_errors"]].to_string())
     print("tables:", {t: len(r) for t, r in sql.tables.items()})
     assert not sql.views, "the dashboard reads the tables: no view is created"
+    assert "DROP VIEW IF EXISTS uat_proj.qualibot.v_chat_quality_daily" in sql.statements
+    assert not any("other_view" in q for q in sql.statements if q.startswith("DROP"))
+    ev = df.set_index(df["message_id"].astype(str))
+    print(ev[["evidence_source", "evidence_count", "retrieval_quality", "compliance_claim", "error_source",
+              "judge_input_tokens", "judge_cost_usd"]].to_string())
+    assert ev.loc["1", "evidence_source"] == "assistant_retrieval" and ev.loc["1", "evidence_count"] == 1
+    assert ev.loc["1", "retrieval_quality"] == "sufficient"
+    assert ev.loc["2", "evidence_source"] == "cited_document_excerpts" and pd.isna(ev.loc["2", "retrieval_quality"])
+    assert ev.loc["4", "retrieval_quality"] == "retrieval_miss" and "retrieval_miss" in ev.loc["4", "failure_reasons"]
+    assert ev.loc["2", "error_source"] == "generation" and ev.loc["4", "error_source"] == "retrieval"
+    assert ev["judge_input_tokens"].min() > 0
     if RESET:
         assert all(len(r) == n and not any(x.get("stale") for x in r) for r, n in
                    [(sql.tables["uat_proj.qualibot.chat_quality_scores"], 4), (sql.tables["uat_proj.qualibot.chat_quality_scoring_runs"], 1)])
