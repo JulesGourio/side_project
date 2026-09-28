@@ -30,6 +30,10 @@ targets:
           # Two overlapping runs would score the same turns twice.
           max_concurrent_runs: 1
 
+          # Serverless standard mode: slower start-up than performance-optimized mode, lower cost. The run mostly waits
+          # on judge calls, so start-up time does not matter.
+          performance_target: STANDARD
+
           # Failure e-mail: real failures, and quality alerts once fail_on_alert is "true".
           email_notifications:
             on_failure:

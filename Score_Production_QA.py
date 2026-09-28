@@ -286,6 +286,9 @@ List the answer's key factual claims (values, thresholds, deadlines, roles, step
 compliance statements), ignoring greetings, generic advice and questions to the user. In a closing table of sources,
 check the document codes and titles, but not the status or version labels ("current", "Courant", "—"): they are not
 claims to verify, unless the evidence shows the document is cancelled, replaced or obsolete, which contradicts them.
+Judge meaning, not wording: a faithful paraphrase, a summary, a heading or an abbreviated title is supported. Lower the
+verdict only for a claim that matters to the user (value, rule, role, scope, condition, document identity) and is
+wrong, overstated or only partly right.
 """ + scope + """
 Write the rationale in English and name the unsupported claims, if any.""",
         feedback_value_type=Literal["supported", "partially_supported", "not_supported"],
@@ -313,7 +316,9 @@ def missed_answer(inputs, outputs, trace):
         instructions="""{{ inputs }} holds a conversation with an assistant on quality documentation (the last user
 message is the question) and passages of quality documents; {{ outputs }} is the assistant's answer. Return yes if the
 answer says the information is not available, or leaves a part of the question unanswered, while the passages DO
-contain that information; otherwise return no. In the rationale (English), state what was missed, if anything.""",
+contain that information; otherwise return no. Asking the user to clarify a genuinely ambiguous request (a word or two
+that could refer to many documents) is not a miss; leaving out a detail that the question does not ask for is not a
+miss either. In the rationale (English), state what was missed, if anything.""",
         feedback_value_type=Literal["yes", "no"],
         model=trace.info.tags.get("judge_model") or None)
     return judge(inputs={"messages": inputs["messages"], "evidence": evidence}, outputs=outputs)
