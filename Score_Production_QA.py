@@ -1090,11 +1090,13 @@ if SAMPLE_RATE < 1.0:
     df_pairs = df_pairs.filter((F.abs(F.hash(F.col("message_id").cast("string"))) % 1000) < int(SAMPLE_RATE * 1000))
 
 cap = TEST_LIMIT or MAX_TURNS_PER_RUN
+TURNS_WAITING = df_pairs.count()                  # every turn still to score, before the cap of this run
 df_pairs = df_pairs.orderBy(F.col("created_at").desc()).limit(cap)
 MESSAGE_ID_TYPE = df_pairs.schema["message_id"].dataType
 CREATED_AT_TYPE = df_pairs.schema["created_at"].dataType
 pdf_pairs = df_pairs.toPandas()
-print(f"{len(pdf_pairs)} assistant turn(s) to score (cap {cap}).")
+print(f"{TURNS_WAITING} assistant turn(s) waiting to be scored · {len(pdf_pairs)} loaded by this run "
+      f"({'test_limit' if TEST_LIMIT else 'cap'} {cap}).")
 
 # COMMAND ----------
 
@@ -1514,7 +1516,7 @@ RUNS_COLUMNS = [
     ("judge_user_agreement", D, "Agreement between the verdict (bad / not bad) and the user votes"),
     ("n_voted", I, "Scored turns with a user vote"),
     ("n_needs_human_review", I, "Turns added to the human review queue"),
-    ("n_turns_left", I, "Turns left for the next run when the time budget was reached"),
+    ("n_turns_left", I, "Turns still waiting to be scored after this run (time budget, test_limit or cap reached)"),
 ]
 RUNS_SCHEMA = StructType([StructField(n, t) for n, t, _ in RUNS_COLUMNS])
 RUNS_DOCS = {n: d for n, _, d in RUNS_COLUMNS}
@@ -1637,7 +1639,7 @@ else:
             write_turns(rows, a_rows)
             records += rows
             assessment_rows += a_rows
-            run_row = write_run(pd.DataFrame(records), len(pending))
+            run_row = write_run(pd.DataFrame(records), TURNS_WAITING - len(records))
             # Pacing: the batch lasts as long as its measured usage takes of the limits; slower after a rejection
             pace = min(pace * 1.5, 4.0) if rate_limited(a_rows) else max(1.0, pace / 1.2)
             batch_usage = [(r["n_judge_calls"], r["judge_input_tokens"], r["judge_output_tokens"]) for r in rows]
@@ -1651,7 +1653,9 @@ else:
             wait = minutes_of_limits(batch_usage) * 60 * pace - (time.time() - b_start)
             if pending and wait > 0:
                 time.sleep(wait)
-    left = f" · {len(pending)} turn(s) left for the next run (time budget reached)" if pending else ""
+    left = (f" · {TURNS_WAITING - len(records)} turn(s) left for the next runs"
+            + (" (time budget reached)" if pending else " (test_limit or cap reached)" if TURNS_WAITING > len(TURNS) else "")
+            if TURNS_WAITING > len(records) else "")
     print(f"{len(records)}/{len(TURNS)} turns scored in {time.time() - t_start:.0f} s · run {MLFLOW_RUN_ID}{left}")
 
 df_final = pd.DataFrame(records)
