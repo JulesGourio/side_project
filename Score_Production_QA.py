@@ -29,9 +29,17 @@
 # MAGIC | `compliance_claim` ¹ | LLM judge on the evidence | evidence_based / unsupported_compliance_claim / not_applicable | every turn |
 # MAGIC | `reference_integrity` ¹, `citation_count` | code | every cited code exists; number of sources | every turn |
 # MAGIC
-# MAGIC ¹ identical in the evaluation notebook. The rule-based **turn verdict** (`good` / `acceptable` / `bad`) combines the
-# MAGIC scorers into `failure_reasons` and the stage at fault, `error_source`: **retrieval** (the index holds what the
-# MAGIC assistant did not retrieve) or **generation** (the model misused or went beyond what it retrieved).
+# MAGIC ¹ identical in the evaluation notebook.
+# MAGIC
+# MAGIC ### Turn verdict
+# MAGIC The rule-based **turn verdict** combines the scorers: `bad` when one of the first reasons applies, `acceptable` when
+# MAGIC only the second ones do, `good` otherwise. `error_source` gives the stage at fault: **retrieval** (the index holds
+# MAGIC what the assistant did not retrieve) or **generation** (the model misused or went beyond what it retrieved).
+# MAGIC
+# MAGIC | Verdict | Failure reasons |
+# MAGIC |---|---|
+# MAGIC | `bad` | `unsupported_claims` (a key claim contradicted by, or absent from, what the assistant retrieved), `unsupported_compliance_claim`, `missed_answer_in_sources` ("not found" although the passages hold it), `retrieval_miss` (on a "not found", partial or clarification answer), `off_topic`, `wrongful_refusal`, `empty_or_error`, `unsafe` |
+# MAGIC | `acceptable` | `partially_supported_claims`, `missed_information` (a detail the passages hold is left out), `retrieval_miss` (on a full answer), `incomplete`, `unverified_reference`, `language_mismatch`, `no_citation`, `user_complaint`, `user_rephrased` |
 # MAGIC
 # MAGIC ### Outputs
 # MAGIC | Where | Content |
@@ -40,6 +48,24 @@
 # MAGIC | `chat_quality_assessments` | one row per turn × scorer: value, numeric value, rationale, error |
 # MAGIC | `chat_quality_scoring_runs` | one row per run: volumes, rates, cost, turns left |
 # MAGIC | MLflow experiment | Runs (one per scoring run), Traces (one per turn, grouped by conversation), Judges (every scorer, not scheduled) |
+# MAGIC
+# MAGIC ### Metrics of an MLflow run
+# MAGIC | Metric | Meaning |
+# MAGIC |---|---|
+# MAGIC | `run/n_messages`, `run/n_turns_left` | Turns scored by the run; turns still waiting for the next runs |
+# MAGIC | `run/good_rate`, `run/bad_rate`, `run/refusal_rate` | Share of good and bad verdicts; share of "not found" and out-of-scope answers |
+# MAGIC | `run/groundedness_rate`, `run/grounding_coverage` | Share of answers fully supported by their evidence; share of answers with evidence |
+# MAGIC | `run/assistant_retrieval_coverage` | Share of turns whose evidence is the assistant's own retrieval |
+# MAGIC | `run/retrieval_miss_rate` | Share of turns where the index held more than the assistant retrieved |
+# MAGIC | `run/n_judge_calls`, `run/judge_input_tokens`, `run/judge_output_tokens`, `run/judge_cost_usd` | Judge usage and cost |
+# MAGIC | `run/n_judge_errors`, `run/n_voted`, `run/n_needs_human_review`, `run/duration_s` | Turns with a scorer error; turns with a user vote; turns queued for human review; duration |
+# MAGIC | `<scorer>/mean` | Mean over the run: 1 = pass, 0 = fail, 0.5 = partial (`missed_answer`: 1 = nothing missed; `citation_count`: sources per answer; `turn_verdict`: good 1, acceptable 0.5, bad 0) |
+# MAGIC | `reason/<reason>` | Turns with each failure reason |
+# MAGIC | `error_source/<stage>` | Turns whose verdict comes from retrieval, generation or both |
+# MAGIC | `bad_rate/<endpoint>` | Bad-verdict rate of each assistant |
+# MAGIC
+# MAGIC In the experiment's run table, a metric that a run did not produce shows "-" (for instance a failure reason that
+# MAGIC did not occur).
 # MAGIC
 # MAGIC ### Operations
 # MAGIC - Judge calls are paced to use `judge_rate_share` of the judge model's token limits, measured with the tokens the
@@ -1711,13 +1737,19 @@ if run_row:
         mlflow.log_metrics({f"error_source/{k}": int(v) for k, v in df_final["error_source"].value_counts().items()})
         by_agent = df_final.groupby("endpoint_name")["turn_verdict"].apply(lambda s: float((s == "bad").mean()))
         mlflow.log_metrics({f"bad_rate/{k}": v for k, v in by_agent.items()})
+        # Mean of every scorer over all the turns of the run (numeric form: 1 = pass, 0 = fail, 0.5 = partial), logged
+        # last: mlflow.genai.evaluate logs <scorer>/mean for each batch, so its own value covers the last batch only
+        scored = pd.DataFrame(assessment_rows)
+        means = scored[scored["value_numeric"].notna()].groupby("assessment_name")["value_numeric"].mean()
+        mlflow.log_metrics({f"{name}/mean": round(float(v), 4) for name, v in means.items()})
         worst = df_final[df_final["turn_verdict"] == "bad"].head(50)
         if len(worst):
             mlflow.log_table(worst[["message_id", "endpoint_name", "question_intent", "user_question", "answer",
                                     "failure_reasons", "error_source", "evidence_source", "groundedness__rationale",
                                     "missed_answer_detail", "retrieval_quality__rationale",
                                     "feedback_vote", "scoring_trace_id"]].astype(str), "worst_turns.json")
-    print(f"✓ MLflow run {MLFLOW_RUN_ID}: metrics run/*, reason/*, error_source/*, bad_rate/*, artifact worst_turns.json")
+    print(f"✓ MLflow run {MLFLOW_RUN_ID}: metrics run/*, <scorer>/mean, reason/*, error_source/*, bad_rate/*, "
+          f"artifact worst_turns.json")
 
 if FEEDBACK_TO_AGENT_TRACES and len(df_final):
     src = AssessmentSource(source_type=AssessmentSourceType.LLM_JUDGE, source_id=f"qualibot-quality-scoring/{JUDGE_CONFIG_ID}")

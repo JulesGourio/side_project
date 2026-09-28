@@ -169,6 +169,11 @@ if not DRY:
     run = mlflow.get_run(ns["MLFLOW_RUN_ID"])
     print("dataset input:", [d.dataset.name for d in run.inputs.dataset_inputs])
     print("metrics:", {k: v for k, v in run.data.metrics.items() if k.startswith(("run/bad", "reason/", "bad_rate"))})
+    a_rows = pd.DataFrame(sql.tables["uat_proj.qualibot.chat_quality_assessments"])
+    expected = a_rows[a_rows["assessment_name"] == "groundedness"]["value_numeric"].astype(float).mean()
+    assert abs(run.data.metrics["groundedness/mean"] - expected) < 1e-3, (run.data.metrics.get("groundedness/mean"), expected)
+    assert "turn_verdict/mean" in run.data.metrics
+    print("scorer means over the whole run: ok")
     assert not LEAKS, f"next user message visible to: {sorted(set(LEAKS))}"
     print("next user message hidden from the other judges: ok")
     print("judge calls by name:", pd.Series([c[0] for c in calls]).value_counts().to_dict())
