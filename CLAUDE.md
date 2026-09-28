@@ -24,7 +24,7 @@
 | `utils/evaluation/Build_Golden_Dataset.py` | Builds the golden evaluation dataset (cached in `uat_landingzone.qualibot.qualibot_eval_cache`) and exports it to the MLflow dataset `uat_landingzone.qualibot.qualibot_eval_golden` |
 | `utils/evaluation/Evaluate_Knowledge_Assistant.py` | Evaluates a Knowledge Assistant endpoint on the golden dataset with MLflow GenAI (traces, judges, report) |
 | `utils/quality_monitoring/Score_Production_QA.py` + `resources/quality_scoring.yml` | Twice-daily LLM-judge scoring of production turns (job `D_3_qualibot-quality-scoring`) |
-| `utils/evaluation/Load_Test_Knowledge_Assistant.py` | Load test of an assistant endpoint: HTTP 429 and silent retrieval failures per concurrency level (tables `ka_load_test_*`) |
+| `utils/evaluation/Load_Test_Knowledge_Assistant.py` | Load test of an assistant endpoint: one MLflow trace per request traced from the caller's side (429 in state ERROR, the assistant's own steps copied, empty retrieval marked ERROR), one child run per concurrency level, charts; tables `ka_load_test_*` |
 | `utils/traces_migration/Migrate_KA_Traces_To_UC.py` + `resources/traces_migration.yml` | Nightly copy of the assistants' MLflow traces to Unity Catalog (job `D_2_qualibot-traces-sync`) |
 | `tests/` (this repository only) | Local end-to-end tests of the notebooks: real MLflow (SQLite), simulated judge model, Vector Search, assistant and Spark (see `README.md`, "Local tests") |
 
@@ -154,6 +154,15 @@
     statuses) and a cancelled instruction (IAQ 04 21 01) presented as current.
 - Frequent warnings: answers that leave out details the cited documents contain (repair case of NCR closure, LBG listed
   among the applicable sites), and an English answer to a Bulgarian question.
+
+### Findings from the load tests (one question, ALL assistants)
+- `ka-7679a56e-endpoint`: HTTP 429 from 10 requests in flight (23/60 at 10, 29/60 at 30), no `Retry-After` header;
+  silent retrieval failures (HTTP 200, empty retrieval step) from 10 in flight (1/60 at 10, 7/60 at 30).
+- `ka-112b2b12-endpoint`, 40 simultaneous requests: 8/40 answers without any document; their trace shows an empty
+  `docs` RETRIEVER step, no `rerank` step, and every step logged `OK`; some retrieval steps carry the exception
+  "The given endpoint does not exist, please retry…" (the assistant's internal Vector Search / reranker call rejected).
+- The assistant's own experiment held 31 traces for 40 requests, all in state OK: rejected requests leave no trace
+  there and silent failures are not flagged. Hence the load test traces every request from the caller's side.
 
 ### Open questions (to ask the user or an expert)
 - Expert: unspecified bore tolerance on Airbus drawings — NSA2010 / ABS1707 (golden) or NSA2110 (assistant)?
