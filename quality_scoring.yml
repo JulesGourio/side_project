@@ -89,8 +89,9 @@ targets:
             - job_cluster_key: scoring_cluster
               new_cluster:
                 policy_id: ${var.job_compute_xs_policy_id}
+                # Fields left out (runtime version, node type, availability) take the policy's defaults: the policy's
+                # auto:latest-lts is resolved when the cluster is created, and the Jobs API rejects it as a literal value.
                 apply_policy_default_values: true
-                spark_version: "auto:latest-lts"
                 num_workers: 0
                 # Without this, Unity Catalog table reads and writes fail with [UC_NOT_ENABLED].
                 data_security_mode: SINGLE_USER
