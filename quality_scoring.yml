@@ -18,6 +18,12 @@
 # successive runs; every batch is written as soon as it is scored. The run stops if the judge endpoint
 # does not answer.
 
+variables:
+  job_compute_xs_policy_id:
+    description: "Cluster policy of the small single-node job clusters (.large node, on-demand driver)"
+    lookup:
+      cluster_policy: "1. Job Compute XS"
+
 targets:
   qualibot-uat:
     resources:
@@ -29,10 +35,6 @@ targets:
 
           # Two overlapping runs would score the same turns twice.
           max_concurrent_runs: 1
-
-          # Serverless standard mode: slower start-up than performance-optimized mode, lower cost. The run mostly waits
-          # on judge calls, so start-up time does not matter.
-          performance_target: STANDARD
 
           # Failure e-mail: real failures, and quality alerts once fail_on_alert is "true".
           email_notifications:
@@ -58,8 +60,11 @@ targets:
             - task_key: "1_score_turns"
               description: "Score new assistant turns with MLflow judges, MERGE into the scores table, run ledger, alerts"
               timeout_seconds: 7200
-              # Serverless: HTTP calls to Luna + Vector Search, light Spark SQL.
-              environment_key: scoring_env
+              job_cluster_key: scoring_cluster
+              # Installed when the cluster starts; the notebook's first cell then finds it and installs nothing.
+              libraries:
+                - pypi:
+                    package: "mlflow[databricks]>=3.11"
               notebook_task:
                 notebook_path: ../utils/quality_monitoring/Score_Production_QA.py
                 source: WORKSPACE
@@ -76,12 +81,24 @@ targets:
                   feedback_to_agent_traces: "false"
                   fail_on_alert: "false"
 
-          environments:
-            - environment_key: scoring_env
-              spec:
-                environment_version: "5"
-                # mlflow>=3.11 is checked (and only installed if missing) by the notebook's first cell,
-                # with the runtime's packages pinned: a protobuf downgrade prevents the kernel from starting.
+          # The run mostly waits on judge calls (HTTP) and writes a few rows per batch: the smallest job cluster is
+          # enough. Policy "1. Job Compute XS": single node, .large node type, latest LTS runtime, spot with fallback
+          # but the first node (the driver, here the only node) on demand. The job identity needs CAN_USE on the
+          # policy.
+          job_clusters:
+            - job_cluster_key: scoring_cluster
+              new_cluster:
+                policy_id: ${var.job_compute_xs_policy_id}
+                apply_policy_default_values: true
+                spark_version: "auto:latest-lts"
+                num_workers: 0
+                # Without this, Unity Catalog table reads and writes fail with [UC_NOT_ENABLED].
+                data_security_mode: SINGLE_USER
+                spark_conf:
+                  spark.databricks.cluster.profile: singleNode
+                  spark.master: "local[*]"
+                custom_tags:
+                  ResourceClass: SingleNode
 
           # Twice a day. Align on the refresh of uat_landingzone.qualibot.chat_messages.
           # Left PAUSED until a first manual run (dry_run=true, then reset_outputs=true with test_limit=20)
