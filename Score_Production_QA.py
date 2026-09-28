@@ -42,7 +42,7 @@
 # MAGIC | MLflow experiment | Runs (one per scoring run), Traces (one per turn, grouped by conversation), Judges (every scorer, not scheduled) |
 # MAGIC
 # MAGIC ### Operations
-# MAGIC - Judge calls are paced to use `JUDGE_RATE_SHARE` of the judge model's token limits, measured with the tokens the
+# MAGIC - Judge calls are paced to use `judge_rate_share` of the judge model's token limits, measured with the tokens the
 # MAGIC   model reports. Turns are scored in batches of about one minute of that budget and written after each batch; no
 # MAGIC   batch starts after `max_run_minutes`, and the turns left are scored by the next run.
 # MAGIC - The run stops if the judge model (`judge_endpoint`) does not answer.
@@ -101,7 +101,8 @@ dbutils.widgets.text("source_schema", "uat_landingzone.qualibot")               
 dbutils.widgets.text("output_schema", "uat_proj.qualibot")                        # output tables
 dbutils.widgets.text("experiment_path", "/Shared/qualibot-quality-scoring")
 dbutils.widgets.text("judge_endpoint", "databricks-gpt-6-luna")                   # judge model serving endpoint
-dbutils.widgets.text("max_run_minutes", "100")      # time budget: no new batch of turns starts after it (backlog absorbed over runs)
+dbutils.widgets.text("max_run_minutes", "330")      # time budget: no new batch of turns starts after it (backlog absorbed over runs)
+dbutils.widgets.text("judge_rate_share", "0.7")     # share of the judge model's token limits used by this run (0.9 for a backlog)
 
 TEST_LIMIT = int(dbutils.widgets.get("test_limit")) if dbutils.widgets.get("test_limit").strip() else None
 DRY_RUN = dbutils.widgets.get("dry_run") == "true"
@@ -113,7 +114,8 @@ SOURCE_SCHEMA = dbutils.widgets.get("source_schema").strip()
 OUTPUT_SCHEMA = dbutils.widgets.get("output_schema").strip()
 EXPERIMENT_PATH = dbutils.widgets.get("experiment_path").strip()
 JUDGE_ENDPOINT = dbutils.widgets.get("judge_endpoint").strip()
-MAX_RUN_MINUTES = float(dbutils.widgets.get("max_run_minutes") or 100)
+MAX_RUN_MINUTES = float(dbutils.widgets.get("max_run_minutes") or 330)
+JUDGE_RATE_SHARE = min(max(float(dbutils.widgets.get("judge_rate_share") or 0.7), 0.05), 0.95)
 
 SOURCE_TABLE = f"{SOURCE_SCHEMA}.chat_messages"
 FEEDBACK_TABLE = f"{SOURCE_SCHEMA}.chat_feedbacks"            # optional: used if it exists
@@ -138,7 +140,6 @@ CORPUS_SEARCH_RESULTS = 10             # chunks of the independent search of the
 # ── Judge model rate limits (pay-per-token endpoint, shared with every other use of the model) ──
 JUDGE_INPUT_TOKENS_PER_MINUTE = 200_000
 JUDGE_OUTPUT_TOKENS_PER_MINUTE = 20_000
-JUDGE_RATE_SHARE = 0.7                 # share of the limits used by this job; the rest stays available to other uses
 JUDGE_MAX_RETRIES = 7                  # retries of a call rejected for rate limit (1 s, 2 s … 60 s: about 2 minutes)
 # The request limits (1,000 per second, 360,000 per hour) are far above the calls of this job. The pacing uses the
 # tokens reported by the judge model for each call.

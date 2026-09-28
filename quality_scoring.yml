@@ -59,7 +59,8 @@ targets:
           tasks:
             - task_key: "1_score_turns"
               description: "Score new assistant turns with MLflow judges, MERGE into the scores table, run ledger, alerts"
-              timeout_seconds: 7200
+              # A scheduled run scores the new turns in minutes; a backlog run stops starting batches after max_run_minutes.
+              timeout_seconds: 21600
               job_cluster_key: scoring_cluster
               # Installed when the cluster starts; the notebook's first cell then finds it and installs nothing.
               libraries:
@@ -73,7 +74,8 @@ targets:
                   output_schema: "uat_proj.qualibot"
                   experiment_path: "/Shared/qualibot-quality-scoring"
                   judge_endpoint: "databricks-gpt-6-luna"
-                  max_run_minutes: "100"
+                  max_run_minutes: "330"
+                  judge_rate_share: "0.7"
                   test_limit: ""
                   dry_run: "false"
                   rescore_changed_config: "false"
