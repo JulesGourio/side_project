@@ -283,7 +283,9 @@ Return:
         instructions="""You verify an answer of an assistant on aerospace quality documentation. {{ inputs }} holds the
 conversation (the last user message is the question) and the evidence; {{ outputs }} is the answer.
 List the answer's key factual claims (values, thresholds, deadlines, roles, steps, document identities, definitions,
-compliance statements), ignoring greetings, generic advice and questions to the user.
+compliance statements), ignoring greetings, generic advice and questions to the user. In a closing table of sources,
+check the document codes and titles, but not the status or version labels ("current", "Courant", "—"): they are not
+claims to verify, unless the evidence shows the document is cancelled, replaced or obsolete, which contradicts them.
 """ + scope + """
 Write the rationale in English and name the unsupported claims, if any.""",
         feedback_value_type=Literal["supported", "partially_supported", "not_supported"],
@@ -349,8 +351,9 @@ information needed to answer the question?
 - full: everything the question asks is in the passages;
 - partial: only part of it;
 - none: nothing relevant;
-- not_applicable: the question needs no documentation (greeting, out-of-scope request, request about the form of the
-  previous answer).
+- not_applicable: the question needs no documentation (greeting, thanks, out-of-scope request).
+When the last message asks to rework the previous answer ("remove document X", "shorter", "in English"), judge the
+passages against the question that answer addressed.
 Write the rationale in English, in one or two sentences, naming what is missing, if anything.""",
         feedback_value_type=Literal["full", "partial", "none", "not_applicable"],
         model=trace.info.tags.get("judge_model") or None)
@@ -609,12 +612,9 @@ def corpus_search(query: str) -> list:
 
 
 def search_query(messages: list) -> str:
-    """Question used by the independent search: the last user message, preceded by the previous one when it is a short
-    follow-up ("same for requirement X")."""
-    users = [m["content"] for m in messages if m["role"] == "user"]
-    if not users:
-        return ""
-    return "\n".join(users[-2:]) if len(users) > 1 and len(users[-1]) < 120 else users[-1]
+    """Question used by the independent search: the last two user messages, so that a follow-up ("same for requirement
+    X", "remove document Y") is searched with the question it refers to."""
+    return "\n".join([m["content"] for m in messages if m["role"] == "user"][-2:])
 
 # ── Numeric form of a verdict: 1 = pass, 0 = fail, 0.5 = partial; counts and durations as is; NULL for labels ──
 SCORE_VALUES = {"yes": 1.0, "no": 0.0, "true": 1.0, "false": 0.0, "full": 1.0, "partial": 0.5, "none": 0.0,
@@ -938,7 +938,8 @@ REASON_STAGE = {"retrieval_miss": "retrieval",
 
 def turn_verdict(v: dict) -> tuple:
     """(verdict, failure_reasons, error_source) from the scorer values. bad = the user was badly served; acceptable =
-    minor issue; error_source = retrieval, generation or retrieval_and_generation, from the reasons of the verdict."""
+    minor issue; error_source = retrieval, generation or retrieval_and_generation, from the reasons of the verdict (a
+    retrieval miss always counts: the index held what the assistant did not retrieve)."""
     bad, warn = [], []
     at, intent = v.get("answer_type"), v.get("question_intent")
     if v.get("safety") == "no":
@@ -979,6 +980,8 @@ def turn_verdict(v: dict) -> tuple:
     elif v.get("user_reaction") == "rephrase_same_question":
         warn.append("user_rephrased")
     stages = {REASON_STAGE[r] for r in (bad or warn) if r in REASON_STAGE}
+    if "retrieval_miss" in warn:                          # what the assistant got wrong, the index held
+        stages.add("retrieval")
     source = "retrieval_and_generation" if len(stages) > 1 else next(iter(stages), None)
     return ("bad" if bad else "acceptable" if warn else "good"), bad + warn, source
 

@@ -146,6 +146,9 @@ if not DRY:
     assert ev.loc["4", "retrieval_quality"] == "retrieval_miss" and "retrieval_miss" in ev.loc["4", "failure_reasons"]
     assert ev.loc["2", "error_source"] == "generation" and ev.loc["4", "error_source"] == "retrieval"
     assert ev["judge_input_tokens"].min() > 0
+    compliance_turn = {"answer_type": "answered_full", "question_intent": "requirement_compliance", "relevance": "yes",
+                       "groundedness": "not_supported", "retrieval_quality": "retrieval_miss", "citation_count": 2}
+    assert ns["turn_verdict"](compliance_turn)[::2] == ("bad", "retrieval_and_generation")
     if RESET:
         assert all(len(r) == n and not any(x.get("stale") for x in r) for r, n in
                    [(sql.tables["uat_proj.qualibot.chat_quality_scores"], 4), (sql.tables["uat_proj.qualibot.chat_quality_scoring_runs"], 1)])
