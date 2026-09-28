@@ -73,7 +73,9 @@ import html as html_mod
 import json
 import math
 import re
-from collections import Counter
+import threading
+import time
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -93,8 +95,14 @@ VS_COLUMNS = ["REF", "chunk_text", "semantic_headers"]
 REF_SOURCE_TABLE = None                                # source table of the index; None = read from the index
 
 # ── Models and endpoints ──
-JUDGE_MODEL = "databricks-gpt-6-luna"
-EMBED_MODEL = "databricks-gte-large-en"                # only used for diversity and de-duplication
+JUDGE_MODEL = "databricks-gpt-6-luna"                 # called directly: the endpoint does not support batch inference
+EMBED_MODEL = "databricks-gte-large-en"                # only used for diversity and de-duplication (ai_query)
+LLM_WORKERS = 8                                        # structured calls in flight
+LLM_RATE_SHARE = 0.7                                   # share of the judge model's token limits used by this notebook
+LLM_INPUT_TOKENS_PER_MINUTE = 200_000
+LLM_OUTPUT_TOKENS_PER_MINUTE = 20_000
+LLM_MAX_ATTEMPTS = 6                                   # retries of a rate-limited or unavailable call (2 s … 60 s)
+LLM_KEYS_PER_WRITE = 300                               # rows of a step written to the cache at a time
 KA_ENDPOINT = "ka-7679a56e-endpoint"                   # qualibot_ALL_v2: the assistant evaluated
 KA_MAX_CONCURRENT = 3                                  # capacity limit of the assistant endpoint
 QUERY_KA_FRESH = True                                  # query the current assistant for every shortlisted case
@@ -304,8 +312,12 @@ def incremental(stage, df_in, keys, build_fn, ok_col=None):
                 _DRY[0] = False
             print("   Remove the step from ESTIMATE_ONLY to run it.")
             return done
-        _delete_keys(stage, kdf, chunk_level)
-        _append(stage, build_fn(todo))
+        # Written by parts: an interrupted step keeps what it computed, and the next run resumes from there
+        for start in range(0, len(todo_keys), LLM_KEYS_PER_WRITE):
+            part = _keys_df(todo_keys[start:start + LLM_KEYS_PER_WRITE], chunk_level)
+            _delete_keys(stage, part, chunk_level)
+            _append(stage, build_fn(df_in.join(part, keys, "inner")))
+            print(f"   {stage}: {min(start + LLM_KEYS_PER_WRITE, len(todo_keys))}/{len(todo_keys)} written")
     return load_stage(stage, chunk_level).join(df_in.select(*keys).distinct(), keys, "inner")
 
 
@@ -331,7 +343,7 @@ def incremental_py(stage, df_in, compute_fn, schema, ok_col=None):
             if res is not None else spark.createDataFrame([], schema))
 
 
-# ── Structured LLM calls (ai_query with a JSON schema) ──
+# ── Structured LLM calls (JSON schema), sent to the serving endpoint and paced on its rate limits ──
 def s_str(desc=None, enum=None):
     d = {"type": "string"}
     if desc:
@@ -375,22 +387,86 @@ def to_ddl(s):
 _DRY = [False]
 
 
+class _Pacer:
+    """Keeps the calls of the last minute within LLM_RATE_SHARE of the judge model's token limits."""
+
+    def __init__(self):
+        self.lock, self.calls = threading.Lock(), deque()
+
+    def reserve(self, tokens_in, tokens_out) -> list:
+        budget_in = LLM_INPUT_TOKENS_PER_MINUTE * LLM_RATE_SHARE
+        budget_out = LLM_OUTPUT_TOKENS_PER_MINUTE * LLM_RATE_SHARE
+        while True:
+            with self.lock:
+                now = time.time()
+                while self.calls and now - self.calls[0][0] > 60:
+                    self.calls.popleft()
+                used_in = sum(c[1] for c in self.calls)
+                used_out = sum(c[2] for c in self.calls)
+                if not self.calls or (used_in + tokens_in <= budget_in and used_out + tokens_out <= budget_out):
+                    entry = [now, tokens_in, tokens_out]
+                    self.calls.append(entry)
+                    return entry
+            time.sleep(1)
+
+    def settle(self, entry, tokens_in, tokens_out):
+        with self.lock:
+            entry[1], entry[2] = tokens_in, tokens_out
+
+
+_PACER = _Pacer()
+_TRANSIENT = ("429", "rate limit", "too many requests", "502", "503", "504", "timed out", "timeout", "temporarily")
+
+
+def _call_llm(model, prompt, response_format) -> tuple:
+    """(JSON text, error) of one structured call to the serving endpoint; rate-limited and transient errors are
+    retried with a growing wait."""
+    body = {"messages": [{"role": "user", "content": prompt}], "response_format": response_format}
+    tokens_in, tokens_out = len(prompt) / CHARS_PER_TOKEN, DEFAULT_OUT_CHARS / CHARS_PER_TOKEN
+    error = None
+    for attempt in range(LLM_MAX_ATTEMPTS):
+        entry = _PACER.reserve(tokens_in, tokens_out)
+        try:
+            resp = w.api_client.do("POST", f"/serving-endpoints/{model}/invocations", body=body)
+            used = resp.get("usage") or {}
+            _PACER.settle(entry, used.get("prompt_tokens") or tokens_in, used.get("completion_tokens") or tokens_out)
+            content = resp["choices"][0]["message"]["content"]
+            if isinstance(content, list):          # content parts
+                content = "".join(c.get("text", "") for c in content if isinstance(c, dict))
+            return content, None
+        except Exception as e:
+            error = str(e)[:500]
+            if not any(t in error.lower() for t in _TRANSIENT):
+                break
+            time.sleep(min(2 ** (attempt + 1), 60))
+    return None, error
+
+
 def llm(df, prompt_col, out_col, props, model=JUDGE_MODEL):
-    """Adds `out_col` (typed struct), `out_col_error`, and prompt/response sizes for cost tracking."""
+    """Adds `out_col` (typed struct), `out_col_error`, and prompt/response sizes for cost tracking. Each distinct prompt
+    is sent once to the serving endpoint from the driver, LLM_WORKERS at a time, paced on its token limits."""
     schema = s_obj(props)
-    rf = json.dumps({"type": "json_schema", "json_schema": {"name": out_col, "schema": schema, "strict": True}})
-    rf_sql = rf.replace("\\", "\\\\").replace("'", "\\'")
-    raw = f"_{out_col}_raw"
-    if _DRY[0]:
-        call = F.struct(F.lit(None).cast("string").alias("result"), F.lit(None).cast("string").alias("errorMessage"))
-    else:
-        call = F.expr(f"ai_query('{model}', {prompt_col}, responseFormat => '{rf_sql}', failOnError => false)")
-    return (df.withColumn(raw, call)
-              .withColumn(out_col, F.from_json(F.col(f"{raw}.result"), to_ddl(schema)))
-              .withColumn(f"{out_col}_error", F.col(f"{raw}.errorMessage"))
+    response_format = {"type": "json_schema", "json_schema": {"name": out_col, "schema": schema, "strict": True}}
+    key, result, error = f"_{out_col}_key", f"_{out_col}_result", f"_{out_col}_errmsg"
+    df = df.withColumn(key, F.sha2(F.coalesce(F.col(prompt_col), F.lit("")), 256))
+    prompts = {r[0]: r[1] for r in df.select(key, prompt_col).distinct().collect()}
+    answers = {}
+    if not _DRY[0]:
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=LLM_WORKERS) as pool:
+            futures = {pool.submit(_call_llm, model, p, response_format): k for k, p in prompts.items() if p}
+            for i, fut in enumerate(as_completed(futures), 1):
+                answers[futures[fut]] = fut.result()
+                if i % 100 == 0 or i == len(futures):
+                    print(f"   {out_col}: {i}/{len(futures)} calls · {time.time() - t0:.0f} s")
+    rows = [(k, *(answers.get(k) or (None, None if _DRY[0] else "empty prompt"))) for k in prompts]
+    answers_df = spark.createDataFrame(rows, f"{key} STRING, {result} STRING, {error} STRING")
+    return (df.join(answers_df, key, "left")
+              .withColumn(out_col, F.from_json(F.col(result), to_ddl(schema)))
+              .withColumn(f"{out_col}_error", F.col(error))
               .withColumn(f"{out_col}_in_chars", F.length(prompt_col))
-              .withColumn(f"{out_col}_out_chars", F.length(F.col(f"{raw}.result")))
-              .drop(raw))
+              .withColumn(f"{out_col}_out_chars", F.length(F.col(result)))
+              .drop(key, result, error))
 
 
 def usage(*outs):

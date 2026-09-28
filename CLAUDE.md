@@ -106,6 +106,10 @@
   (turn not scored). Variable-length data (document lists, next user message, errors) goes to the trace step
   `answer_context` (`record_answer_context`), which the scorers read.
 - `relevance` and `answer_type` must not judge language, facts or evidence.
+- `databricks-gpt-6-luna` does not support batch inference (`ai_query` fails with PERMISSION_DENIED): the golden
+  dataset builder calls the endpoint directly from the driver (`llm()`: one call per distinct prompt, `LLM_WORKERS` in
+  flight, paced on `LLM_RATE_SHARE` of the token limits, 429 retried) and writes each step to the cache by parts of
+  `LLM_KEYS_PER_WRITE` rows, so an interrupted step resumes. Embeddings still use `ai_query`.
 - Reading traces stored in Unity Catalog requires `MLFLOW_TRACING_SQL_WAREHOUSE_ID`.
 - An MLflow experiment's parent folder must exist (`w.workspace.mkdirs`).
 - Document codes: compare with a key insensitive to language suffix (`_FR`, `.FR`, `_GB`, `_BG`…), separators, case
