@@ -127,7 +127,7 @@ NEIGHBOUR_WINDOW = 1             # chunks taken before and after each directly r
 
 # Shortlist quotas for log questions (predicates in section 3)
 SLOT_QUOTAS = {
-    "production_retrieval_miss": 3, "production_compliance_claim": 3, "production_failure": 4,
+    "production_retrieval_miss": 3, "production_compliance_claim": 3, "production_failure": 4, "production_pass": 6,
     "negative_feedback": 5, "suspect_answer": 4, "multi_doc_or_hard": 4,
     "requirement_compliance": 4, "document_lookup": 5, "procedure": 4, "rule_requirement": 4,
     "definition_acronym": 3, "multi_turn": 3, "out_of_scope": 2, "other_language": 1,
@@ -833,16 +833,21 @@ try:
     _extra = [c for c in ("error_source", "compliance_claim") if c in _scores.columns]
     prod_bad = {str(r["message_id"]): r.asDict() for r in _scores.filter("golden_candidate")
                                                              .select("message_id", *_extra).collect()}
+    # Turns judged good and not voted down: regression cases (the assistant must keep answering them well)
+    prod_good = {str(r["message_id"]) for r in _scores.filter("turn_verdict = 'good' AND NOT golden_candidate")
+                                                      .select("message_id").collect()}
 except Exception:
-    prod_bad = {}
+    prod_bad, prod_good = {}, set()
 _prod = lambda a: prod_bad.get(str(a)) if pd.notna(a) else None
 pdf["production_failure"] = pdf["answer_id"].map(lambda a: _prod(a) is not None)
+pdf["production_pass"] = pdf["answer_id"].map(lambda a: pd.notna(a) and str(a) in prod_good)
 pdf["production_error_source"] = pdf["answer_id"].map(lambda a: (_prod(a) or {}).get("error_source"))
 pdf["production_compliance_claim"] = pdf["answer_id"].map(
     lambda a: (_prod(a) or {}).get("compliance_claim") == "unsupported_compliance_claim")
 print(f"{len(prod_bad)} production failure(s) available, {int(pdf['production_failure'].sum())} among the annotated turns "
       f"(retrieval at fault: {int(pdf['production_error_source'].isin(['retrieval', 'retrieval_and_generation']).sum())}, "
-      f"unsupported compliance claims: {int(pdf['production_compliance_claim'].sum())})")
+      f"unsupported compliance claims: {int(pdf['production_compliance_claim'].sum())}) · "
+      f"{int(pdf['production_pass'].sum())} annotated turns judged good (regression cases)")
 
 is_log = (pdf["source"] == "log").values
 km = KMeans(n_clusters=min(N_CLUSTERS, max(2, is_log.sum() // 5)), n_init=10, random_state=42)
@@ -873,6 +878,7 @@ SLOT_PREDICATES = {
     "production_retrieval_miss": lambda r: r.production_error_source in ("retrieval", "retrieval_and_generation"),
     "production_compliance_claim": lambda r: bool(r.production_compliance_claim),
     "production_failure": lambda r: bool(r.production_failure),
+    "production_pass": lambda r: bool(r.production_pass),
     "negative_feedback":  lambda r: r.vote == "down" and r.feedback_triage in ("legitimate", "ambiguous"),
     "suspect_answer":     lambda r: r.ka_answer_assessment in ("wrong_or_hallucinated", "partial", "refusal"),
     "multi_doc_or_hard":  lambda r: r.intent == "comparison_multi_doc" or r.difficulty == "hard",
@@ -1489,6 +1495,13 @@ def select_final(pdf):
                                                                 "production_retrieval_miss", "production_compliance_claim"])],
          MAX_NEEDS_EXPERT)
     fill(ok, TARGET_N)
+    for label, n, minimum in [("cases the assistant fails", count(lambda r: r.ka_verdict in KA_FAIL), MIN_KA_FAIL),
+                              ("cases the assistant passes", count(lambda r: r.ka_verdict == "correct"), MIN_KA_OK),
+                              ("compliance questions", count(lambda r: r.intent == "requirement_compliance"), MIN_COMPLIANCE),
+                              ("refusal cases", count(lambda r: r.final_answerability in ("none", "out_of_scope")),
+                               MIN_REFUSAL_CASES)]:
+        if n < minimum:
+            print(f"⚠️ {label}: {n} selected, {minimum} wanted — not enough such cases in the shortlist")
     out = pdf[pdf["question_id"].isin(chosen)].copy()
     out["needs_expert"] = out["confidence_final"] < 2
     return out.sort_values(["needs_expert", "confidence_final"], ascending=[False, True])
