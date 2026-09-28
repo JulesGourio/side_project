@@ -76,9 +76,9 @@ class Spark:
         return FakeDF(pdf, columns=["id", "trace_id", "content"])
     def sql(self, q, *a):
         sql.run(q)
-        if q.startswith("SHOW VIEWS"):
-            return types.SimpleNamespace(collect=lambda: [{"viewName": "v_chat_quality_daily", "isTemporary": False},
-                                                          {"viewName": "other_view", "isTemporary": False}])
+        if "information_schema.views" in q:
+            return types.SimpleNamespace(collect=lambda: [{"table_name": "v_chat_quality_daily"},
+                                                          {"table_name": "other_view"}])
         if "AS bad_rate" in q and q.lstrip().startswith("SELECT"):
             return FakeDF(pd.DataFrame({"endpoint_name": ["ka-7679a56e-endpoint"] * 5, "day": pd.date_range("2026-09-17", periods=5),
                                         "n": [20, 20, 20, 20, 20], "bad_rate": [0.1, 0.1, 0.1, 0.1, 0.6]}))

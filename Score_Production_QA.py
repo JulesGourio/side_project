@@ -1726,10 +1726,12 @@ if FAIL_ON_ALERT and alerts:
 # DBTITLE 1,Output schema — the dashboard reads the tables: views over the quality outputs are dropped
 QUALITY_VIEW_PREFIXES = ("v_chat_quality_", "v_ka_eval_", "v_quality_shared_scorers")
 if not DRY_RUN:
-    for r in spark.sql(f"SHOW VIEWS IN {OUTPUT_SCHEMA}").collect():
-        if r["viewName"].startswith(QUALITY_VIEW_PREFIXES) and not r["isTemporary"]:
-            spark.sql(f"DROP VIEW IF EXISTS {OUTPUT_SCHEMA}.{r['viewName']}")
-            print(f"View dropped: {OUTPUT_SCHEMA}.{r['viewName']}")
+    _catalog, _schema = OUTPUT_SCHEMA.split(".", 1)
+    for r in spark.sql(f"SELECT table_name FROM {_catalog}.information_schema.views "
+                       f"WHERE table_schema = '{_schema}'").collect():
+        if r["table_name"].startswith(QUALITY_VIEW_PREFIXES):
+            spark.sql(f"DROP VIEW IF EXISTS {OUTPUT_SCHEMA}.{r['table_name']}")
+            print(f"View dropped: {OUTPUT_SCHEMA}.{r['table_name']}")
 
 # COMMAND ----------
 
