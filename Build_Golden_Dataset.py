@@ -11,22 +11,24 @@
 # MAGIC |---|---|---|
 # MAGIC | 1 | Extract question/answer turns from the chat logs, with conversation history and user votes | – |
 # MAGIC | 2 | Annotate every question: intent, quality, test value, self-contained rewrite, feedback triage | 1 per question |
-# MAGIC | 3 | Build a diversified shortlist: embeddings + clustering + quotas, including production failures | embeddings |
+# MAGIC | 3 | Build a diversified shortlist: embeddings + clustering + quotas, including production failures, production passes and compliance questions (production scoring verdicts and intents of the same answers) | embeddings |
 # MAGIC | 4 | Query the current assistant (answer and the passages it retrieved, from its trace), and generate search queries (keywords, translation, title, hypothetical answer) | 1 per case |
-# MAGIC | 5 | Pool evidence from many retrieval routes | – |
+# MAGIC | 5 | Pool evidence from many retrieval routes (question, rewrites, hypothetical answer, documents cited or retrieved by the assistant, documents and process sheets named in the question) | – |
 # MAGIC | 6 | Grade every candidate chunk, expand around the most relevant ones (similar chunks of the same document, and the chunks just before and after in document order), grade the additions | 1 per chunk |
 # MAGIC | 7 | Generate two independent reference answers (A/B) from the relevant chunks | 2 per case |
 # MAGIC | 8 | Arbitrate: merge A/B, confront the assistant's answers, verdicts, confidence | 1 per case |
 # MAGIC | 9 | Verify every fact independently | 1 per case |
-# MAGIC | 10 | Consolidate and select a balanced final set of 20 to 30 cases, compliance-matrix questions included | – |
+# MAGIC | 10 | Consolidate and select a balanced final set of 20 to 30 cases (compliance questions, cases the assistant fails and passes, few refusal cases); report the agreement with the production scoring | – |
 # MAGIC | 11 | Human review (validate / reject / expert) | – |
 # MAGIC | 12 | Export to the MLflow evaluation dataset (Unity Catalog), linked to the evaluation experiment, and to the flat table `ka_eval_golden_cases` (composition and review status, for the dashboard) | – |
 # MAGIC | 13 | Cost: estimate vs actual | – |
 # MAGIC
 # MAGIC **Persistence and restart.** Every step is cached in a single Delta table (`CACHE_TABLE`, one row per
 # MAGIC step × question [× chunk], JSON payload). Each section reloads its inputs from the cache: run section 0, then any
-# MAGIC section directly. LLM steps only process rows that are missing or failed, so re-running never pays twice.
-# MAGIC To recompute a step: `FORCE = {"step_name"}`, run it, then reset `FORCE = set()`.
+# MAGIC section directly. Every step records a fingerprint of what it read (input columns, prompt, parameters): a row
+# MAGIC is recomputed only when it is missing, failed, or its inputs changed (new evidence, new prompt), so re-running never
+# MAGIC pays twice and never keeps a stale result. The assistant's answers (`ka_fresh`) are the exception: they are only
+# MAGIC asked again with `FORCE = {"ka_fresh"}` (after a change of the assistant), then reset `FORCE = set()`.
 # MAGIC
 # MAGIC **Document references.** Codes are compared with a key insensitive to language suffix (`PRLAT538_FR` = `PRLAT538_GB`),
 # MAGIC separators, case and zero padding (`IN_APO_006` = `IN_APO_0006`, a typo that exists inside some documents).
@@ -70,6 +72,7 @@ print({p: _installed(p) for p in NEEDED})
 # DBTITLE 1,0.1 Configuration
 import hashlib
 import html as html_mod
+import inspect
 import json
 import math
 import re
@@ -129,15 +132,16 @@ NEIGHBOUR_WINDOW = 1             # chunks taken before and after each directly r
 SLOT_QUOTAS = {
     "production_retrieval_miss": 3, "production_compliance_claim": 3, "production_failure": 4, "production_pass": 6,
     "negative_feedback": 5, "suspect_answer": 4, "multi_doc_or_hard": 4,
-    "requirement_compliance": 4, "document_lookup": 5, "procedure": 4, "rule_requirement": 4,
+    "requirement_compliance": 6, "document_lookup": 5, "procedure": 4, "rule_requirement": 4,
     "definition_acronym": 3, "multi_turn": 3, "out_of_scope": 2, "other_language": 1,
 }
 # Final selection constraints
 MAX_PER_INTENT = 6
 MIN_KA_FAIL = 10                 # cases the assistant fails: they discriminate between versions of the assistant
 MIN_KA_OK = 8                    # cases the assistant passes: regression protection
-MIN_COMPLIANCE = 3               # customer compliance-matrix questions (about half of the production traffic)
+MIN_COMPLIANCE = 5               # customer compliance-matrix questions (about half of the production traffic)
 MIN_REFUSAL_CASES = 2            # expected answer = "not in the documentation" / out of scope
+MAX_REFUSAL_CASES = 4            # refusal cases are rarer in production (about 15% of the dataset at most)
 MAX_NEEDS_EXPERT = 3             # low-confidence cases kept for expert review
 
 # ── Cost (pay-per-token, DBU per 1M tokens) ──
@@ -223,8 +227,9 @@ def _cache(stage):
     return spark.table(CACHE_TABLE).filter(F.col("stage") == stage)
 
 
-def load_stage(stage, chunk_level=None):
-    """Typed DataFrame of a cached step, or None if the step never ran."""
+def load_stage(stage, chunk_level=None, with_hash=False):
+    """Typed DataFrame of a cached step, or None if the step never ran. input_hash (fingerprint of the inputs the row
+    was computed from) is only kept for the cache itself."""
     chunk_level = stage in CHUNK_STAGES if chunk_level is None else chunk_level
     t = _cache(stage)
     row = t.orderBy(F.desc("updated_at")).select("payload_schema").limit(1).collect()
@@ -232,7 +237,10 @@ def load_stage(stage, chunk_level=None):
         return None
     schema = T.StructType.fromJson(json.loads(row[0][0]))
     keys = ["question_id"] + (["chunk_id"] if chunk_level else [])
-    return t.select(*keys, F.from_json("payload", schema).alias("_d")).select(*keys, "_d.*")
+    df = t.select(*keys, F.from_json("payload", schema).alias("_d")).select(*keys, "_d.*")
+    if with_hash:
+        return df if "input_hash" in df.columns else df.withColumn("input_hash", F.lit(None).cast("string"))
+    return df.drop("input_hash")
 
 
 def stage_payloads(stage) -> list:
@@ -288,18 +296,28 @@ def checkpoint(stage, build_fn):
     return load_stage(stage)
 
 
-def incremental(stage, df_in, keys, build_fn, ok_col=None):
-    """Spark LLM step: only processes the keys missing from the cache (or failed, when ok_col is NULL).
-    build_fn(todo) returns a DataFrame with `keys` + the output columns."""
+def with_input_hash(df, depends_on, config):
+    """Adds input_hash: fingerprint of the columns a step reads and of its configuration (prompt, parameters)."""
+    return df.withColumn("input_hash", F.sha2(F.concat(F.to_json(F.struct(*depends_on)), F.lit(hashlib.sha256(
+        str(config).encode()).hexdigest())), 256))
+
+
+def incremental(stage, df_in, keys, build_fn, ok_col=None, depends_on=None, config=""):
+    """Spark LLM step: only processes the keys missing from the cache, failed (ok_col NULL) or stale (the columns listed
+    in depends_on, or config, changed since the row was computed). build_fn(todo) returns a DataFrame with `keys` + the
+    output columns."""
     chunk_level = "chunk_id" in keys
     if _forced(stage):
         _delete_stage(stage)
-    done = load_stage(stage, chunk_level)
-    cand = df_in.select(*keys).distinct()
+    match = keys + (["input_hash"] if depends_on else [])
+    if depends_on:
+        df_in = with_input_hash(df_in, depends_on, config)
+    done = load_stage(stage, chunk_level, with_hash=True)
+    cand = df_in.select(*match).distinct()
     if done is not None:
         ok = done.filter(F.col(ok_col).isNotNull()) if ok_col else done
-        cand = cand.join(ok.select(*keys).distinct(), keys, "left_anti")
-    todo_keys = cand.collect()          # frozen keys: the step no longer depends on the state of the cache
+        cand = cand.join(ok.select(*match).distinct(), match, "left_anti")
+    todo_keys = cand.select(*keys).distinct().collect()   # frozen keys: the step no longer depends on the cache state
     print(f"→ {stage}: {len(todo_keys)} row(s) to process")
     if todo_keys:
         kdf = _keys_df(todo_keys, chunk_level)
@@ -311,33 +329,45 @@ def incremental(stage, df_in, keys, build_fn, ok_col=None):
             finally:
                 _DRY[0] = False
             print("   Remove the step from ESTIMATE_ONLY to run it.")
-            return done
+            return done.drop("input_hash") if done is not None else None
         # Written by parts: an interrupted step keeps what it computed, and the next run resumes from there
         for start in range(0, len(todo_keys), LLM_KEYS_PER_WRITE):
             part = _keys_df(todo_keys[start:start + LLM_KEYS_PER_WRITE], chunk_level)
+            todo = df_in.join(part, keys, "inner")
+            out = build_fn(todo)
+            if depends_on:
+                out = out.join(todo.select(*keys, "input_hash").dropDuplicates(keys), keys, "left")
             _delete_keys(stage, part, chunk_level)
-            _append(stage, build_fn(df_in.join(part, keys, "inner")))
+            _append(stage, out)
             print(f"   {stage}: {min(start + LLM_KEYS_PER_WRITE, len(todo_keys))}/{len(todo_keys)} written")
     return load_stage(stage, chunk_level).join(df_in.select(*keys).distinct(), keys, "inner")
 
 
-def incremental_py(stage, df_in, compute_fn, schema, ok_col=None):
-    """Step computed on the driver (Vector Search, assistant endpoint), keyed by question_id.
-    compute_fn(rows) returns tuples in the order of the schema."""
+def incremental_py(stage, df_in, compute_fn, schema, ok_col=None, depends_on=None, config=""):
+    """Step computed on the driver (Vector Search, assistant endpoint), keyed by question_id; recomputed like
+    incremental() when missing, failed or stale. compute_fn(rows) returns tuples in the order of the schema."""
     if _forced(stage):
         _delete_stage(stage)
-    done = load_stage(stage)
+    match = ["question_id"] + (["input_hash"] if depends_on else [])
+    if depends_on:
+        df_in = with_input_hash(df_in, depends_on, config)
+    done = load_stage(stage, with_hash=True)
     todo = df_in
     if done is not None:
         ok = done.filter(F.col(ok_col).isNotNull()) if ok_col else done
-        todo = df_in.join(ok.select("question_id").distinct(), "question_id", "left_anti")
+        todo = df_in.join(ok.select(*match).distinct(), match, "left_anti")
     rows = todo.collect()
     print(f"→ {stage}: {len(rows)} case(s) to process")
     if rows:
         out = compute_fn(rows)
+        if out:
+            res = spark.createDataFrame(out, schema)
+            if depends_on:
+                res = res.join(spark.createDataFrame([(int(r["question_id"]), r["input_hash"]) for r in rows],
+                                                     "question_id long, input_hash string"), "question_id", "left")
         _delete_keys(stage, _keys_df([(r["question_id"],) for r in rows], False))
         if out:
-            _append(stage, spark.createDataFrame(out, schema))
+            _append(stage, res)
     res = load_stage(stage)
     return (res.join(df_in.select("question_id").distinct(), "question_id", "inner")
             if res is not None else spark.createDataFrame([], schema))
@@ -525,6 +555,15 @@ def base_ref(s) -> str:
     return "".join(str(int(g)) if g.isdigit() else g for g in groups)
 
 
+def plain_ref(s) -> str:
+    """Document code without the « REF: » label the excerpts are headed with."""
+    return re.sub(r"^\s*REF\s*:\s*", "", str(s)).strip()
+
+
+# A statement about the excerpts (« … is not in the excerpts ») is a limit of the evidence, not an expected fact
+META_FACT = re.compile(r"\b(excerpts?|extraits?|extractos?|výňat\w*)\b", re.I)
+
+
 def code_like(text) -> set:
     """Document codes cited in a text: **REF** in bold and ?ref= parameters of links."""
     text = str(text or "")
@@ -553,6 +592,18 @@ def resolve_refs(refs) -> list:
     catalog = load_ref_catalog()
     tokens = refs if isinstance(refs, (list, tuple, set)) else re.split(r"[,;\n]+", str(refs or ""))
     return sorted({real for t in tokens if len(base_ref(t)) >= 3 for real in catalog.get(base_ref(t), set())})
+
+
+_PROCESS_CODE = re.compile(r"\b([A-Z])\s?(\d{2})\b")
+
+
+def process_sheet_refs(*texts) -> list:
+    """Process sheets of the process codes cited in a text: S40 → PRO-S40, P28 → PROLAT_P28_FR (all variants)."""
+    codes = {a + b for t in texts for a, b in _PROCESS_CODE.findall(str(t or "").upper())}
+    if not codes:
+        return []
+    pattern = re.compile(r"^PRO(?:LAT)?(?:%s)[A-Z]?$" % "|".join(sorted(codes)))
+    return sorted({real for key, reals in load_ref_catalog().items() if pattern.match(key) for real in reals})
 
 
 def refs_in_sources_json(raw) -> list:
@@ -766,6 +817,9 @@ Fields:
 - question_quality (1-5): clarity, specificity, realism. 1 = unintelligible or test message.
 - eval_value (1-5): value as a test case. 5 = realistic, precise, representative of a real need, with an answer that can be
   checked in the documentation (or clearly out of scope). 1 = no value (greeting, test, trivial duplicate, bare link request).
+  Customer compliance-matrix questions (is the company compliant with a customer requirement, which document proves it)
+  are about half of the real traffic: rate them on the standalone question, even when the user only wrote a short
+  follow-up such as « idem pour <requirement> ».
 - ka_answer_assessment: a priori impression of Qualibot's answer, WITHOUT access to the documents: looks_correct, partial,
   wrong_or_hallucinated, refusal, unclear. For a synthetic question without answer: unclear.
 - feedback_triage: legitimate (real RAG failure), user_error (out-of-scope expectation, ill-posed question), ambiguous,
@@ -803,7 +857,9 @@ def build_annotations(d):
 
 
 df_qa = load_stage("qa_pairs")
-df_ann = df_qa.join(incremental("annotations", df_qa, ["question_id"], build_annotations, ok_col="intent"), "question_id")
+df_ann = df_qa.join(incremental("annotations", df_qa, ["question_id"], build_annotations, ok_col="intent",
+                                 depends_on=["history_text", "question", "actual_response", "has_sources", "vote", "comment"],
+                                 config=PROMPT_ANNOTATE + json.dumps(ANNOTATE_PROPS)), "question_id")
 display(df_ann.groupBy("intent", "in_scope").count().orderBy(F.desc("count")))
 
 # COMMAND ----------
@@ -820,34 +876,41 @@ def build_embeddings(d):
 
 
 df_emb = incremental("embeddings", df_ann.select("question_id", "standalone_question"), ["question_id"],
-                     build_embeddings, ok_col="emb")
+                     build_embeddings, ok_col="emb", depends_on=["standalone_question"], config=EMBED_MODEL)
 pdf = (df_ann.join(df_emb.select("question_id", "emb"), "question_id")
        .filter(F.col("emb").isNotNull() & F.col("intent").isNotNull()).toPandas().reset_index(drop=True))
 E = np.vstack(pdf["emb"].apply(lambda v: np.asarray(v, dtype=np.float32)).values)
 E /= np.linalg.norm(E, axis=1, keepdims=True) + 1e-9
 
-# Turns judged bad (or voted down) by the production quality scoring: the most valuable test cases. The stage at fault
-# (retrieval or generation) and unsupported compliance claims come from the same scoring.
+# Production quality scoring of the same answers (answer_id = message_id of the scores table): turns judged bad or voted
+# down are the most valuable test cases, turns judged good are regression cases; the stage at fault (retrieval or
+# generation), unsupported compliance claims and the verdict itself come from the same scoring.
 try:
     _scores = spark.table(PROD_SCORES_TABLE)
     _extra = [c for c in ("error_source", "compliance_claim") if c in _scores.columns]
-    prod_bad = {str(r["message_id"]): r.asDict() for r in _scores.filter("golden_candidate")
-                                                             .select("message_id", *_extra).collect()}
-    # Turns judged good and not voted down: regression cases (the assistant must keep answering them well)
-    prod_good = {str(r["message_id"]) for r in _scores.filter("turn_verdict = 'good' AND NOT golden_candidate")
-                                                      .select("message_id").collect()}
+    prod_turns = {str(r["message_id"]): r.asDict() for r in _scores.select(
+        "message_id", "turn_verdict", "golden_candidate", "question_intent", *_extra).collect()}
 except Exception:
-    prod_bad, prod_good = {}, set()
-_prod = lambda a: prod_bad.get(str(a)) if pd.notna(a) else None
-pdf["production_failure"] = pdf["answer_id"].map(lambda a: _prod(a) is not None)
+    prod_turns = {}
+prod_bad = {m for m, t in prod_turns.items() if t["golden_candidate"]}
+prod_good = {m for m, t in prod_turns.items() if t["turn_verdict"] == "good" and not t["golden_candidate"]}
+_turn = lambda a: prod_turns.get(str(a), {}) if pd.notna(a) else {}
+pdf["production_verdict"] = pdf["answer_id"].map(lambda a: _turn(a).get("turn_verdict"))
+pdf["production_failure"] = pdf["answer_id"].map(lambda a: pd.notna(a) and str(a) in prod_bad)
 pdf["production_pass"] = pdf["answer_id"].map(lambda a: pd.notna(a) and str(a) in prod_good)
-pdf["production_error_source"] = pdf["answer_id"].map(lambda a: (_prod(a) or {}).get("error_source"))
+pdf["production_error_source"] = pdf["answer_id"].map(
+    lambda a: _turn(a).get("error_source") if pd.notna(a) and str(a) in prod_bad else None)
 pdf["production_compliance_claim"] = pdf["answer_id"].map(
-    lambda a: (_prod(a) or {}).get("compliance_claim") == "unsupported_compliance_claim")
-print(f"{len(prod_bad)} production failure(s) available, {int(pdf['production_failure'].sum())} among the annotated turns "
-      f"(retrieval at fault: {int(pdf['production_error_source'].isin(['retrieval', 'retrieval_and_generation']).sum())}, "
-      f"unsupported compliance claims: {int(pdf['production_compliance_claim'].sum())}) · "
-      f"{int(pdf['production_pass'].sum())} annotated turns judged good (regression cases)")
+    lambda a: pd.notna(a) and str(a) in prod_bad and _turn(a).get("compliance_claim") == "unsupported_compliance_claim")
+# The production scoring labels questions with the same intents, reading the whole conversation: its compliance label
+# wins, since compliance-matrix questions are often short follow-ups (« idem pour <requirement> »)
+_prod_compliance = pdf["answer_id"].map(lambda a: _turn(a).get("question_intent") == "requirement_compliance")
+pdf.loc[_prod_compliance, "intent"] = "requirement_compliance"
+print(f"{len(prod_turns)} production turns scored, {int(pdf['production_verdict'].notna().sum())} among the annotated "
+      f"turns · failures: {int(pdf['production_failure'].sum())} (retrieval at fault: "
+      f"{int(pdf['production_error_source'].isin(['retrieval', 'retrieval_and_generation']).sum())}, unsupported "
+      f"compliance claims: {int(pdf['production_compliance_claim'].sum())}) · judged good: "
+      f"{int(pdf['production_pass'].sum())} · compliance questions: {int((pdf['intent'] == 'requirement_compliance').sum())}")
 
 is_log = (pdf["source"] == "log").values
 km = KMeans(n_clusters=min(N_CLUSTERS, max(2, is_log.sum() // 5)), n_init=10, random_state=42)
@@ -927,17 +990,27 @@ for slot, quota in SLOT_QUOTAS.items():
         used_clusters[pdf.at[i, "cluster"]] += 1
 
 override_ids = {o["question_id"] for o in MANUAL_OVERRIDES}
+_opt = lambda v: v if pd.notna(v) else None
 sel_rows = [(int(pdf.at[i, "question_id"]),
              "synthetic" if pdf.at[i, "question_id"] < 0 else ("override" if pdf.at[i, "question_id"] in override_ids else "log"),
              slot_of[i], float(pdf.at[i, "score"]), int(pdf.at[i, "cluster"]), bool(pdf.at[i, "production_failure"]),
-             pdf.at[i, "production_error_source"] if pd.notna(pdf.at[i, "production_error_source"]) else None)
+             _opt(pdf.at[i, "production_error_source"]), _opt(pdf.at[i, "production_verdict"]), pdf.at[i, "intent"])
             for i in chosen]
 df_sel = spark.createDataFrame(sel_rows, "question_id long, source string, slot string, score double, cluster int, "
-                                         "production_failure boolean, production_error_source string")
-df_hints = spark.createDataFrame([(int(o["question_id"]), o.get("expected_response"), o.get("expected_sources"))
-                                  for o in MANUAL_OVERRIDES + SYNTHETIC_QUERIES],
-                                 "question_id long, hint_response string, hint_sources string")
-replace_stage("shortlist", df_sel.join(df_ann.drop("source"), "question_id").join(df_hints, "question_id", "left"))
+                                         "production_failure boolean, production_error_source string, "
+                                         "production_verdict string, intent string")
+
+
+def human_expectations(o) -> str:
+    """Facts and guidelines a human set for a curated case: exported as they are, so the judges must not restate them."""
+    lines = [f"- fact: {f}" for f in o.get("human_facts", [])] + [f"- guideline: {g}" for g in o.get("human_guidelines", [])]
+    return "\n".join(lines) or None
+
+
+df_hints = spark.createDataFrame([(int(o["question_id"]), o.get("expected_response"), o.get("expected_sources"),
+                                   human_expectations(o)) for o in MANUAL_OVERRIDES + SYNTHETIC_QUERIES],
+                                 "question_id long, hint_response string, hint_sources string, human_expectations string")
+replace_stage("shortlist", df_sel.join(df_ann.drop("source", "intent"), "question_id").join(df_hints, "question_id", "left"))
 df_short = load_stage("shortlist")
 print(f"Shortlist: {df_short.count()} cases")
 display(df_short.groupBy("source", "slot").count().orderBy("source", "slot"))
@@ -1009,7 +1082,9 @@ def build_reform(d):
 
 
 df_reform_in = df_short.join(get_ka().select("question_id", "ka_fresh_response"), "question_id", "left")
-df_reform = incremental("reformulations", df_reform_in, ["question_id"], build_reform, ok_col="search_queries")
+df_reform = incremental("reformulations", df_reform_in, ["question_id"], build_reform, ok_col="search_queries",
+                        depends_on=["standalone_question", "history_text", "actual_response", "ka_fresh_response"],
+                        config=PROMPT_REFORM)
 
 # COMMAND ----------
 
@@ -1051,6 +1126,7 @@ def _pool_one(r) -> list:
         "assistant_retrieval": resolve_refs(list(r.ka_fresh_retrieved_refs or [])),
         "mentioned": resolve_refs(list(r.mentioned_refs or []) + sorted(code_like(r.actual_response))
                                   + sorted(code_like(r.ka_fresh_response))),
+        "process_sheet": process_sheet_refs(q, sq),
     }
     for origin, refs in groups.items():
         if refs:
@@ -1061,7 +1137,7 @@ def _pool_one(r) -> list:
         if not resolve_refs([c]):
             _ref_warnings[c.strip()] += 1
 
-    priority = {"hint", "assistant_logs", "assistant_current", "assistant_retrieval", "mentioned"}
+    priority = {"hint", "assistant_logs", "assistant_current", "assistant_retrieval", "mentioned", "process_sheet"}
     items = sorted(chunks.items(), key=lambda kv: (bool(kv[1]["origins"] & priority), len(kv[1]["origins"]),
                                                    kv[1]["best_score"]), reverse=True)[:MAX_POOL_CHUNKS]
     return [(int(r.question_id), cid, c["REF"], c["semantic_headers"], c["chunk_text"], sorted(c["origins"]),
@@ -1087,7 +1163,11 @@ df_pool_in = (df_short
                          .withColumn("hypothetical_answer", F.lit(None).cast("string")), "question_id", "left")
               .join(get_ka().select("question_id", "ka_fresh_response", "ka_fresh_refs", "ka_fresh_retrieved_refs"),
                     "question_id", "left"))
-df_pool = incremental_py("evidence_pool", df_pool_in, compute_pool, POOL_SCHEMA)
+df_pool = incremental_py("evidence_pool", df_pool_in, compute_pool, POOL_SCHEMA,
+                         depends_on=["question", "standalone_question", "search_queries", "hypothetical_answer",
+                                     "mentioned_refs", "hint_sources", "retrieved_context", "actual_response",
+                                     "ka_fresh_response", "ka_fresh_refs", "ka_fresh_retrieved_refs"],
+                         config=inspect.getsource(_pool_one) + str(MAX_POOL_CHUNKS))
 display(df_pool.groupBy("question_id").agg(F.count("*").alias("chunks"), F.countDistinct("REF").alias("documents")).summary())
 
 # COMMAND ----------
@@ -1100,6 +1180,9 @@ Judge whether the EXCERPT helps answer the QUESTION.
      reference document).
 - 1: same general topic, but does not help answer.
 - 0: unrelated.
+A question may have several parts (two processes or documents to compare, several items to list): an excerpt that
+answers one part is relevant (3 when it answers that part directly), even if it says nothing about the other parts.
+An excerpt of a document the question names explicitly, stating what that document is or what it contains, is at least 2.
 An approximate human hint of the expected answer may be given: use it to recognise the information sought, but judge only
 what the excerpt contains.
 extracted_facts: when relevance >= 2, the facts of the excerpt useful for the answer, self-contained and faithful to the
@@ -1128,7 +1211,9 @@ def all_evidence():
 
 def grade(evidence):
     grade_in = evidence.join(df_short.select("question_id", "standalone_question", "hint_response"), "question_id")
-    return incremental("chunk_grades", grade_in, ["question_id", "chunk_id"], build_grades, ok_col="relevance")
+    return incremental("chunk_grades", grade_in, ["question_id", "chunk_id"], build_grades, ok_col="relevance",
+                       depends_on=["standalone_question", "hint_response", "REF", "semantic_headers", "chunk_text"],
+                       config=PROMPT_GRADE)
 
 
 df_short = load_stage("shortlist")
@@ -1162,7 +1247,8 @@ exp_in = (pool.join(graded, ["question_id", "chunk_id"])
           .agg(F.collect_list(F.when(F.col("relevance") == 3, F.struct("REF", "chunk_text"))).alias("best_chunks"),
                F.collect_list("chunk_id").alias("known_ids"))
           .filter(F.size("best_chunks") > 0))
-incremental_py("evidence_expansion", exp_in, compute_expansion, POOL_SCHEMA)
+incremental_py("evidence_expansion", exp_in, compute_expansion, POOL_SCHEMA,
+               depends_on=[F.sort_array("best_chunks"), F.sort_array("known_ids")], config=EXPANSION_PER_CHUNK)
 
 
 # Neighbours: the chunks just before and after each directly relevant chunk, in document order (chunk_index of the
@@ -1194,7 +1280,8 @@ nb_in = (all_evidence().join(load_stage("chunk_grades").select("question_id", "c
          .agg(F.collect_list(F.when(F.col("relevance") == 3, F.struct("REF", "chunk_text"))).alias("best_chunks"))
          .join(pooled.groupBy("question_id").agg(F.collect_list("chunk_id").alias("known_ids")), "question_id")
          .filter(F.size("best_chunks") > 0))
-incremental_py("evidence_neighbours", nb_in, compute_neighbours, POOL_SCHEMA)
+incremental_py("evidence_neighbours", nb_in, compute_neighbours, POOL_SCHEMA,
+               depends_on=[F.sort_array("best_chunks"), F.sort_array("known_ids")], config=NEIGHBOUR_WINDOW)
 
 grades = grade(all_evidence())
 display(grades.groupBy("relevance").count().orderBy("relevance"))
@@ -1240,15 +1327,19 @@ Absolute rules:
   contradicts the excerpts, follow the excerpts and say so in missing_information.
 
 Fields:
-- answerability: full (the excerpts fully answer), partial (incomplete answer), none (the excerpts do not allow an answer),
-  out_of_scope (unrelated to the quality documentation).
+- answerability: full (the excerpts fully answer), partial (they answer part of the question: for instance one of two
+  documents or processes to compare is described, the other is not), none (nothing in the excerpts answers any part of
+  the question), out_of_scope (unrelated to the quality documentation).
 - expected_facts: 1 to 8 atomic facts a good answer must contain (one fact = one checkable statement: value, deadline,
-  responsible role, step, document code…), each tied to the REF of the excerpt that proves it. Empty for none/out_of_scope.
+  responsible role, step, document code…), written in English whatever the language of the question, each tied to the
+  plain document code (e.g. PRLAT508, without any prefix) of the excerpt that proves it. A fact states what the
+  documentation says; it never describes the excerpts themselves (« X is not in the excerpts » is not a fact: it goes to
+  missing_information). Empty for none/out_of_scope.
 - expected_response: the ideal answer as Qualibot should give it — same language as the question, markdown, documents
   cited in the text (« According to **PRLAT508**, … »), concise and actionable. If information is missing, say what is
   missing and give what is partially available. Out of scope: politely explain that Qualibot only covers the quality
   documentation.
-- expected_sources: REF codes of the documents that are indispensable to the answer.
+- expected_sources: plain codes of the documents that prove the facts a correct answer must contain.
 - missing_information: what is missing or ambiguous (empty if nothing).
 
 Compliance questions (does the company meet a customer or standard requirement, which document proves it): the expected
@@ -1280,31 +1371,51 @@ def build_gen(d):
 
 
 df_gen_in = load_stage("shortlist").join(evidence_df(), "question_id", "left")
-df_gen = incremental("gold_candidates", df_gen_in, ["question_id"], build_gen, ok_col="gen_a")
+df_gen = incremental("gold_candidates", df_gen_in, ["question_id"], build_gen, ok_col="gen_a",
+                     depends_on=["standalone_question", "hint_response", "hint_sources", "context", "context_rev"],
+                     config=PROMPT_GEN + json.dumps(GEN_PROPS))
 
 # COMMAND ----------
 
 # DBTITLE 1,8. Arbitration — merge A/B, confront the assistant's answers, verdicts, guidelines, confidence
 PROMPT_ARB = """You are the final arbiter of an evaluation dataset for Qualibot (RAG on aerospace quality documentation).
 You have:
-- the relevant EXCERPTS: the ONLY source of truth;
+- the relevant EXCERPTS: the ONLY source of truth for the reference;
 - two reference candidates A and B, generated independently;
 - Qualibot's answer in production (logs) and its current answer;
-- the user's feedback and an optional human hint.
+- the user's feedback, an optional human hint, and optional HUMAN EXPECTATIONS (facts and guidelines a human set for this
+  case: they are added to the dataset as they are).
 
 Build the final reference:
 - expected_facts: merge the correct facts of A and B. Add a fact given by Qualibot only if an excerpt proves it. Remove any
-  fact the excerpts do not prove. importance = essential when a correct answer MUST contain it (ideally 1 to 5 essential
-  facts), secondary otherwise.
+  fact the excerpts do not prove, and never restate a human expectation (in any language). Facts are written in English,
+  atomic, about what the documentation says — never about the excerpts (« X is not in the excerpts » is not a fact).
+  importance = essential when a correct answer MUST contain it (1 to 5 essential facts: the core of the answer only),
+  secondary otherwise (details, context, complements).
 - expected_response: the best answer (Qualibot style: language of the question, markdown, **REF** cited in the text,
   concise), containing only proven information.
-- expected_sources: indispensable REF codes.
-- answerability: full, partial, none or out_of_scope.
-- guidelines: 1 to 3 behavioural guidelines a judge can check, only when they matter for this case (e.g. « Must cite
-  PRLAT508 », « Must say the information is not in the documentation instead of inventing it »). For a compliance
-  question, the reference concludes on compliance only as far as the excerpts establish it.
-- ka_log_verdict and ka_fresh_verdict: correct, partially_correct, incorrect, justified_refusal, unjustified_refusal,
-  not_available (no answer).
+- expected_sources: plain codes (no prefix) of the documents proving the essential facts.
+- answerability: full, partial (part of the question is answered: e.g. one of two compared documents is described), none
+  (no part answered), out_of_scope.
+- guidelines: 0 to 3 behavioural guidelines, in English, specific to this case and checkable by a judge (e.g. « Must
+  identify PRLAT508 as the procedure », « Must say the requirement is not covered by the documentation instead of
+  inventing it »). Never about the answer's language (measured separately), its format, length or citation style
+  (Qualibot cites with numbered markers linked to its sources: a document is cited when it is among them), and never a
+  repetition of a human expectation. For a compliance question, the reference concludes on compliance only as far as
+  the excerpts establish it.
+- ka_log_verdict and ka_fresh_verdict: the verdict on each Qualibot answer, on its CONTENT:
+    correct: every essential fact is present (meaning, not wording) and nothing contradicts the excerpts;
+    partially_correct: the core of the answer is right, but an essential fact is missing or partly wrong;
+    incorrect: the core of the answer is wrong, contradicts the excerpts, identifies the wrong document, or asserts
+      compliance (or a rule) the excerpts do not establish;
+    justified_refusal: says the documentation does not answer, and the excerpts indeed do not (answerability none or
+      out_of_scope);
+    unjustified_refusal: says it cannot answer although the excerpts answer at least part of the question;
+    not_available: no answer.
+  Qualibot read its own passages, which may differ from these excerpts: a statement the excerpts neither confirm nor
+  contradict is not an error by itself (mention it in disagreements); it lowers the verdict only when it is the core of
+  the answer (the value, rule, role, document or conclusion asked for). Language, format, length, citation style and
+  courtesy text never change the verdict.
 - disagreements: A/B disagreements, contradictions between the hint and the excerpts, or between Qualibot and the excerpts.
 - confidence: high (explicit excerpts, A and B agree), medium, low (indirect excerpts, contradictions, ambiguous question);
   confidence_reasons in one or two sentences."""
@@ -1331,6 +1442,8 @@ def build_arb(d):
         PROMPT_ARB,
         "\n\n### Question\n", F.col("standalone_question"),
         "\n\n### Human hint\n", F.col("hint_response"), " | documents: ", F.col("hint_sources"),
+        "\n\n### Human expectations (added as they are; do not restate)\n",
+        F.coalesce(F.col("human_expectations"), F.lit("(none)")),
         "\n\n### User feedback\n", F.concat_ws(" — ", F.col("vote"), F.col("comment")),
         "\n\n### Excerpts\n", F.col("context"),
         "\n\n### Reference A\n", F.to_json("gen_a"),
@@ -1343,7 +1456,10 @@ def build_arb(d):
 df_arb_in = (load_stage("shortlist").join(evidence_df(), "question_id", "left")
              .join(load_stage("gold_candidates"), "question_id")
              .join(get_ka().select("question_id", "ka_fresh_response"), "question_id", "left"))
-df_arb = incremental("gold_arbitrated", df_arb_in, ["question_id"], build_arb, ok_col="arb")
+df_arb = incremental("gold_arbitrated", df_arb_in, ["question_id"], build_arb, ok_col="arb",
+                     depends_on=["standalone_question", "hint_response", "hint_sources", "human_expectations", "vote",
+                                 "comment", "context", "gen_a", "gen_b", "actual_response", "ka_fresh_response"],
+                     config=PROMPT_ARB + json.dumps(ARB_PROPS))
 
 # COMMAND ----------
 
@@ -1378,7 +1494,8 @@ def build_verify(d):
 
 
 df_ver_in = load_stage("shortlist").join(evidence_df(), "question_id", "left").join(load_stage("gold_arbitrated"), "question_id")
-df_ver = incremental("gold_verified", df_ver_in, ["question_id"], build_verify, ok_col="ver")
+df_ver = incremental("gold_verified", df_ver_in, ["question_id"], build_verify, ok_col="ver",
+                     depends_on=["standalone_question", "context", "arb"], config=PROMPT_VERIFY + json.dumps(VERIFY_PROPS))
 
 # COMMAND ----------
 
@@ -1386,6 +1503,7 @@ df_ver = incremental("gold_verified", df_ver_in, ["question_id"], build_verify, 
 # Final confidence = arbiter confidence (high 3 / medium 2 / low 1), minus 1 for each warning sign: an essential fact
 # not verified, an unfaithful reference answer, or generations A and B disagreeing on answerability.
 KA_FAIL = {"incorrect", "partially_correct", "unjustified_refusal"}
+KA_PASS = {"correct", "justified_refusal"}
 CONF = {"high": 3, "medium": 2, "low": 1}
 
 pdf_all = (load_stage("shortlist")
@@ -1406,7 +1524,7 @@ def ka_failure_stage(verdict, expected_sources, retrieved, n_passages):
         return None
     if n_passages is None or pd.isna(n_passages):
         return "unknown"
-    expected = {base_ref(re.sub(r"^\s*REF\s*:\s*", "", str(d))) for d in expected_sources}
+    expected = {base_ref(plain_ref(d)) for d in expected_sources}
     got = {base_ref(d) for d in (retrieved if retrieved is not None else [])}
     return "generation" if not expected or expected & got else "retrieval"
 
@@ -1427,12 +1545,14 @@ def consolidate(r):
     essential, secondary, rejected = [], [], []
     for i, f in enumerate(_g(arb, "expected_facts", []), start=1):
         ok, ev = checks.get(i, (False, ""))
-        item = {"fact": _g(f, "fact", ""), "source_ref": _g(f, "source_ref", "") or ev}
+        item = {"fact": _g(f, "fact", ""), "source_ref": plain_ref(_g(f, "source_ref", "") or ev)}
+        ok = ok and not META_FACT.search(item["fact"])
         (rejected if not ok else essential if _g(f, "importance") == "essential" else secondary).append(item)
     cur = CURATED.get(int(r.question_id), {})
     human = [{"fact": f, "source_ref": "human"} for f in cur.get("human_facts", [])]
     essential = human + [f for f in essential if not any(f["fact"].strip().lower() == h["fact"].strip().lower() for h in human)]
-    n_essential_proposed = sum(_g(f, "importance") == "essential" for f in _g(arb, "expected_facts", []))
+    n_essential_proposed = sum(_g(f, "importance") == "essential" and not META_FACT.search(_g(f, "fact", ""))
+                               for f in _g(arb, "expected_facts", []))
     conf = CONF.get(_g(arb, "confidence"), 1)
     if n_essential_proposed and len(essential) - len(human) < n_essential_proposed:
         conf -= 1
@@ -1451,7 +1571,7 @@ def consolidate(r):
         "final_answerability": _g(arb, "answerability"),
         "essential_facts": essential, "secondary_facts": secondary, "rejected_facts": rejected,
         "expected_response": _g(arb, "expected_response", ""),
-        "expected_sources": list(_g(arb, "expected_sources", [])),
+        "expected_sources": list(dict.fromkeys(plain_ref(d) for d in _g(arb, "expected_sources", []))),
         "guidelines": list(dict.fromkeys(cur.get("human_guidelines", []) + list(_g(arb, "guidelines", [])))),
         "ka_log_verdict": _g(arb, "ka_log_verdict"), "ka_fresh_verdict": fresh,
         "ka_verdict": fresh if fresh != "not_available" else _g(arb, "ka_log_verdict", "not_available"),
@@ -1472,6 +1592,7 @@ def select_final(pdf):
     chosen = list(pdf.loc[pdf["source"].isin(["override", "synthetic"]), "question_id"])
     count = lambda pred: sum(pred(by_id.loc[q]) for q in chosen)
     intents = Counter(by_id.loc[chosen, "intent"])
+    is_refusal = lambda r: r.final_answerability in ("none", "out_of_scope")
 
     def fill(cands, n):
         k = 0
@@ -1479,6 +1600,8 @@ def select_final(pdf):
             if k >= n or len(chosen) >= TARGET_N:
                 break
             if r.question_id in chosen or intents[r.intent] >= MAX_PER_INTENT:
+                continue
+            if is_refusal(r) and count(is_refusal) >= MAX_REFUSAL_CASES:
                 continue
             chosen.append(r.question_id)
             intents[r.intent] += 1
@@ -1490,13 +1613,13 @@ def select_final(pdf):
          MIN_COMPLIANCE - count(lambda r: r.intent == "requirement_compliance"))
     fill(ok[ok["final_answerability"].isin(["none", "out_of_scope"])],
          MIN_REFUSAL_CASES - count(lambda r: r.final_answerability in ("none", "out_of_scope")))
-    fill(ok[ok["ka_verdict"] == "correct"], MIN_KA_OK - count(lambda r: r.ka_verdict == "correct"))
+    fill(ok[ok["ka_verdict"].isin(KA_PASS)], MIN_KA_OK - count(lambda r: r.ka_verdict in KA_PASS))
     fill(pdf[(pdf["confidence_final"] < 2) & pdf["slot"].isin(["negative_feedback", "production_failure",
                                                                 "production_retrieval_miss", "production_compliance_claim"])],
          MAX_NEEDS_EXPERT)
     fill(ok, TARGET_N)
     for label, n, minimum in [("cases the assistant fails", count(lambda r: r.ka_verdict in KA_FAIL), MIN_KA_FAIL),
-                              ("cases the assistant passes", count(lambda r: r.ka_verdict == "correct"), MIN_KA_OK),
+                              ("cases the assistant passes", count(lambda r: r.ka_verdict in KA_PASS), MIN_KA_OK),
                               ("compliance questions", count(lambda r: r.intent == "requirement_compliance"), MIN_COMPLIANCE),
                               ("refusal cases", count(lambda r: r.final_answerability in ("none", "out_of_scope")),
                                MIN_REFUSAL_CASES)]:
@@ -1524,7 +1647,7 @@ GOLDEN_SCHEMA = T.StructType([T.StructField(n, t) for n, t in [
     ("context", T.StringType()), ("essential_facts_json", T.StringType()), ("secondary_facts_json", T.StringType()),
     ("rejected_facts_json", T.StringType()), ("expected_sources_json", T.StringType()), ("guidelines_json", T.StringType()),
     ("messages_json", T.StringType()), ("production_error_source", T.StringType()),
-    ("ka_failure_stage", T.StringType())]])
+    ("ka_failure_stage", T.StringType()), ("production_verdict", T.StringType())]])
 
 
 def _py(v, t):
@@ -1553,6 +1676,24 @@ print(f"Final selection: {len(pdf_final)} cases")
 print(pdf_final.groupby("source").size().to_string())
 print(pdf_final["ka_verdict"].value_counts().to_string())
 print(pdf_final["final_answerability"].value_counts().to_string())
+
+# Agreement with the production scoring on the same logged answers: the verdict of this builder against the reference
+# (ka_log_verdict) and the production turn verdict (no reference; judges on the assistant's own passages)
+PROD_EQUIVALENT = {"correct": "good", "justified_refusal": "good", "partially_correct": "acceptable",
+                   "incorrect": "bad", "unjustified_refusal": "bad"}
+both = pdf_all[pdf_all["production_verdict"].notna() & pdf_all["ka_log_verdict"].isin(list(PROD_EQUIVALENT))].copy()
+if both.empty:
+    print("No shortlisted answer is scored in production yet: score the production backlog (job D_3) first.")
+else:
+    both["expected_prod"] = both["ka_log_verdict"].map(PROD_EQUIVALENT)
+    print(f"Agreement with the production scoring: {(both['expected_prod'] == both['production_verdict']).mean():.0%} "
+          f"of {len(both)} shortlisted answers scored in both")
+    print(pd.crosstab(both["ka_log_verdict"], both["production_verdict"]).to_string())
+    opposite = both[((both["expected_prod"] == "good") & (both["production_verdict"] == "bad"))
+                    | ((both["expected_prod"] == "bad") & (both["production_verdict"] == "good"))]
+    for _, r in opposite.iterrows():
+        print(f"  opposite verdicts, to review: #{r.question_id} builder {r.ka_log_verdict} / production "
+              f"{r.production_verdict} — {str(r.question)[:100]}")
 
 # COMMAND ----------
 
@@ -1788,17 +1929,14 @@ CASE_FIXES = [
      {"facts": ["Cites IN_MRPC009 (Work center management) as the procedure for managing work centers.",
                 "Cites MM-1004 among the relevant procedures.", "Cites GO-1594 among the relevant procedures."],
       "sources": ["IN_MRPC009_FR", "MM-1004", "GO-1594"]}),
-    ("process sheet R80", {"drop_facts_containing": ["Q0265QP", "import", "tous les sites"]}),
+    ("process sheet R80", {"drop_facts_containing": ["Q0265QP", "import", "tous les sites", "all sites"]}),
     ("ordre d'attribution des sites", {"drop_facts_containing": ["rule_"]}),
     ("OPEX Sharepoint", {"drop_facts_containing": ["intraqual"]}),
     ("REP_OUT and REP_FMB",                                            # not defined in the documentation: refusal case
      {"facts": [], "sources": [],
       "expected_response": "REP_OUT and REP_FMB are not defined in the available documentation; the assistant says so "
                            "and asks for clarification, without inventing a definition."}),
-    ("for which plants it is applicable",
-     {"reject": "reference to rebuild: the assistant cites IN-004 / QP-1232 / QP-1188, absent from the evidence"}),
     ("Access Policy", {"reject": "wrong expectation: the comparison is possible on the text given in the question"}),
-    ("NF-10845 et NS-1868", {"reject": "incomplete evidence: NF-10845 was not retrieved, to regenerate"}),
     ("tolérance d'un alésage", {"reject": "to be settled by an expert: NSA2010/ABS1707 or NSA2110?"}),
 ]
 
@@ -1822,21 +1960,18 @@ def fix_for(r):
     return next((f for key, f in CASE_FIXES if key.lower() in str(r.messages_json).lower()), {})
 
 
-def clean_ref(s):
-    return re.sub(r"^\s*REF\s*:\s*", "", str(s)).strip()
-
-
 def to_record(r):
     fix = fix_for(r)
     facts = list(fix["facts"]) if "facts" in fix else [f["fact"] for f in r.essential_facts]
     for needle in fix.get("drop_facts_containing", []):
         facts = [f for f in facts if needle.lower() not in f.lower()]
+    facts = [f for f in facts if not META_FACT.search(f)]
     # The correctness judge accepts expected_facts OR expected_response, never both
     exp = {"expected_facts": facts} if facts else {"expected_response": fix.get("expected_response", r.expected_response)}
     exp["guidelines"] = [LANG_GUIDELINE, *CURATED.get(int(r.question_id), {}).get("human_guidelines", [])]
     if r.intent == "requirement_compliance":
         exp["guidelines"].append(COMPLIANCE_GUIDELINE)
-    sources = [clean_ref(s) for s in fix.get("sources", r.expected_sources)]
+    sources = list(dict.fromkeys(plain_ref(s) for s in fix.get("sources", r.expected_sources)))
     if sources:
         exp["expected_retrieved_context"] = [{"doc_uri": s} for s in sources]
     return {"inputs": {"messages": json.loads(r.messages_json)}, "expectations": exp}
@@ -1894,6 +2029,10 @@ GOLDEN_CASES_COLUMNS = [
     ("ka_failure_stage", T.StringType(), "When the current assistant fails the case: retrieval (it retrieved none of the "
                                          "expected documents), generation (it retrieved them) or unknown; NULL otherwise"),
     ("production_error_source", T.StringType(), "Stage at fault found by the production scoring, for production failures"),
+    ("ka_log_verdict", T.StringType(), "Verdict of the builder on the answer logged in production, against the reference "
+                                       "(correct, partially_correct, incorrect, …; not_available for synthetic cases)"),
+    ("production_verdict", T.StringType(), "Turn verdict of the production scoring on the same logged answer (good, "
+                                           "acceptable, bad); NULL when that turn is not scored"),
 ]
 GOLDEN_CASES_SCHEMA = T.StructType([T.StructField(n, t) for n, t, _ in GOLDEN_CASES_COLUMNS])
 exported_ids = set(kept["question_id"])
@@ -1909,9 +2048,11 @@ for _, r in pdf_final.iterrows():
         None if qid in exported_ids else reject_notes.get(qid, f"review status: {status(qid)}"),
         status(qid), decisions.get(qid, ("", ""))[1] or None, r.source, r.slot, r.intent, r.difficulty, r.language,
         r.question, r.final_answerability, "\n".join(facts) or rec.get("expected_response", r.expected_response),
-        len(facts), [clean_ref(d["doc_uri"]) for d in rec.get("expected_retrieved_context", [])] or list(r.expected_sources),
+        len(facts), [plain_ref(d["doc_uri"]) for d in rec.get("expected_retrieved_context", [])]
+        or [plain_ref(d) for d in r.expected_sources],
         list(rec.get("guidelines", r.guidelines)), r.ka_verdict, int(r.confidence_final), EVAL_DATASET_UC, exported_at,
-        *[None if pd.isna(v) else v for v in (r.ka_failure_stage, r.production_error_source)]))
+        *[None if pd.isna(v) else v for v in (r.ka_failure_stage, r.production_error_source, r.ka_log_verdict,
+                                               r.production_verdict)]))
 esc = lambda t: str(t).replace("'", "\\'")
 if not spark.catalog.tableExists(GOLDEN_CASES_TABLE):
     spark.sql(f"CREATE TABLE {GOLDEN_CASES_TABLE} (" + ", ".join(
