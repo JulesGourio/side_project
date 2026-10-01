@@ -1,16 +1,22 @@
 # Quality Scoring Job — Qualibot production turns
 #
-# Judges every assistant turn already answered by the Knowledge Assistants (no call to the KA
-# endpoints): conversation-level quality (1 Luna call) + grounding against the cited documents
-# (1 Luna call, excerpts fetched from the Vector Search index). Writes uat_proj.qualibot.chat_quality_scores
-# (MERGE on message_id) and chat_quality_scoring_runs; the DEV dashboard queries these UAT tables.
+# Scores the assistant turns already answered by the Knowledge Assistants (no call to the KA endpoints)
+# with the MLflow judges and scorers registered in the scoring experiment. The judges compare each answer
+# with the passages the assistant retrieved, read from its own MLflow trace, and tell retrieval errors
+# from generation errors (an independent search of the index). Writes the documented tables
+# uat_proj.qualibot.chat_quality_scores, chat_quality_assessments and chat_quality_scoring_runs, and
+# drops the views over them (the dashboard reads the tables).
 #
 # Notebook: utils/quality_monitoring/Score_Production_QA.py
-#   base_parameters: source_schema / output_schema / experiment_path, plus test_limit, dry_run,
-#   rescore_changed_config for ad-hoc runs ("Run now with different parameters").
+#   base_parameters: source_schema / output_schema / experiment_path / judge_endpoint; max_run_minutes
+#   (no batch of turns starts after it, the turns left are scored by the next run); test_limit, dry_run,
+#   rescore_changed_config, reset_outputs, feedback_to_agent_traces for ad-hoc runs; fail_on_alert: "true"
+#   makes a run that raises a quality alert fail on purpose, which sends the failure e-mail below.
 #
-# Sizing: ~30 turns/day today, peaks of 300+ expected in prod → 2 Luna calls per turn,
-# 8 turns in parallel (MAX_WORKERS in the notebook): a 150-turn run takes ~10-15 min.
+# Throughput: judge calls are paced on 70% of the judge model's token limits (200k input and 20k
+# output tokens per minute), measured with the tokens the model reports. A backlog is absorbed over
+# successive runs; every batch is written as soon as it is scored. The run stops if the judge endpoint
+# does not answer.
 
 targets:
   qualibot-uat:
@@ -23,6 +29,11 @@ targets:
 
           # Two overlapping runs would score the same turns twice.
           max_concurrent_runs: 1
+
+          # Failure e-mail: real failures, and quality alerts once fail_on_alert is "true".
+          email_notifications:
+            on_failure:
+              - jules.gourio.external@latecoere.aero
 
           tags:
             project: Qualibot
@@ -41,7 +52,7 @@ targets:
 
           tasks:
             - task_key: "1_score_turns"
-              description: "Score new assistant turns, MERGE by batch, run ledger, alerts, MLflow run"
+              description: "Score new assistant turns with MLflow judges, MERGE into the scores table, run ledger, alerts"
               timeout_seconds: 7200
               # Serverless: HTTP calls to Luna + Vector Search, light Spark SQL.
               environment_key: scoring_env
@@ -52,22 +63,25 @@ targets:
                   source_schema: "uat_landingzone.qualibot"
                   output_schema: "uat_proj.qualibot"
                   experiment_path: "/Shared/qualibot-quality-scoring"
+                  judge_endpoint: "databricks-gpt-6-luna"
+                  max_run_minutes: "100"
                   test_limit: ""
                   dry_run: "false"
                   rescore_changed_config: "false"
                   reset_outputs: "false"
+                  feedback_to_agent_traces: "false"
+                  fail_on_alert: "false"
 
           environments:
             - environment_key: scoring_env
               spec:
                 environment_version: "5"
-                # mlflow is checked (and only installed if missing) by the notebook's first cell,
-                # with the runtime's packages pinned — see the protobuf kernel crash of 2026-09.
-                dependencies:
-                  - httpx
+                # mlflow>=3.11 is checked (and only installed if missing) by the notebook's first cell,
+                # with the runtime's packages pinned: a protobuf downgrade prevents the kernel from starting.
 
           # Twice a day. Align on the refresh of uat_landingzone.qualibot.chat_messages.
-          # Left PAUSED until a first manual run (dry_run=true, then test_limit=20) is validated.
+          # Left PAUSED until a first manual run (dry_run=true, then reset_outputs=true with test_limit=20)
+          # is validated.
           schedule:
             quartz_cron_expression: "0 0 3,15 * * ?"
             timezone_id: "Europe/Paris"
