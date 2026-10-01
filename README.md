@@ -78,7 +78,7 @@ missed); labels have no numeric form. Evaluation rows carry their run's start ti
 | `ka_eval_assessments` | run × case × scorer | evaluation notebook | rationales, errors, human ratings |
 | `ka_load_test_requests` | load test request | load test notebook | status, latency, documents, anomaly of each request |
 | `ka_load_test_summary` | load test × level | load test notebook | 429, silent retrieval failures and latency per concurrency level |
-| `ka_eval_golden_cases` | golden case | golden dataset builder | dataset composition and review progress |
+| `ka_eval_golden_cases` | golden case | golden dataset builder | dataset composition and review progress; stage at fault of the cases the assistant fails (`ka_failure_stage`: retrieval / generation); agreement with the production scoring on the same logged answer (`ka_log_verdict` vs `production_verdict`) |
 
 Compare scores of the same `judge_config_id` (production) or `scorers_config_id` (evaluation): a change of judges,
 judge model or verdict rules changes the fingerprint.
@@ -101,6 +101,8 @@ SQL_DUMP=/tmp/scoring.json .venv/bin/python tests/test_scoring.py && SQL_DUMP=/t
 .spark/bin/python tests/test_sql.py /tmp/scoring.json /tmp/eval.json   # table DDL with comments, inserts, dashboard queries
 .spark/bin/python tests/test_neighbours.py    # neighbour expansion of the golden dataset builder
 .spark/bin/python tests/test_golden_export.py # flat golden cases table
+.spark/bin/python tests/test_builder_llm.py   # builder's structured calls to the judge endpoint (retries, errors)
+.spark/bin/python tests/test_builder_cache.py # builder's step cache (recomputes missing, failed and stale rows only), process sheets
 .venv/bin/python tests/test_load.py          # load test against a simulated endpoint: traces, runs, charts (needs requests, databricks-sdk, matplotlib, ipython); "retries" = client retrying throttled requests
 ```
 

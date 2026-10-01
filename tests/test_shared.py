@@ -42,7 +42,9 @@ import json
 import mlflow
 from mlflow.entities import Document
 
-mlflow.set_tracking_uri("sqlite:///" + __import__("tempfile").mkdtemp() + "/mlflow.db")
+import os, tempfile
+os.chdir(tempfile.mkdtemp(prefix="shared_test_"))       # trace artifacts are written under the working directory
+mlflow.set_tracking_uri(f"sqlite:///{os.getcwd()}/mlflow.db")
 block = production[production.index("_SOURCE_HEADER = re.compile"):production.index("def record_assistant_retrieval")]
 ns = {"re": re, "json": json, "Document": Document}
 exec(block, ns)

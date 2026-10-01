@@ -244,7 +244,12 @@ Return:
         instructions="""You verify an answer of an assistant on aerospace quality documentation. {{ inputs }} holds the
 conversation (the last user message is the question) and the evidence; {{ outputs }} is the answer.
 List the answer's key factual claims (values, thresholds, deadlines, roles, steps, document identities, definitions,
-compliance statements), ignoring greetings, generic advice and questions to the user.
+compliance statements), ignoring greetings, generic advice and questions to the user. In a closing table of sources,
+check the document codes and titles, but not the status or version labels ("current", "Courant", "—"): they are not
+claims to verify, unless the evidence shows the document is cancelled, replaced or obsolete, which contradicts them.
+Judge meaning, not wording: a faithful paraphrase, a summary, a heading or an abbreviated title is supported. Lower the
+verdict only for a claim that matters to the user (value, rule, role, scope, condition, document identity) and is
+wrong, overstated or only partly right.
 """ + scope + """
 Write the rationale in English and name the unsupported claims, if any.""",
         feedback_value_type=Literal["supported", "partially_supported", "not_supported"],
@@ -272,7 +277,9 @@ def missed_answer(inputs, outputs, trace):
         instructions="""{{ inputs }} holds a conversation with an assistant on quality documentation (the last user
 message is the question) and passages of quality documents; {{ outputs }} is the assistant's answer. Return yes if the
 answer says the information is not available, or leaves a part of the question unanswered, while the passages DO
-contain that information; otherwise return no. In the rationale (English), state what was missed, if anything.""",
+contain that information; otherwise return no. Asking the user to clarify a genuinely ambiguous request (a word or two
+that could refer to many documents) is not a miss; leaving out a detail that the question does not ask for is not a
+miss either. In the rationale (English), state what was missed, if anything.""",
         feedback_value_type=Literal["yes", "no"],
         model=trace.info.tags.get("judge_model") or None)
     return judge(inputs={"messages": inputs["messages"], "evidence": evidence}, outputs=outputs)
@@ -310,8 +317,9 @@ information needed to answer the question?
 - full: everything the question asks is in the passages;
 - partial: only part of it;
 - none: nothing relevant;
-- not_applicable: the question needs no documentation (greeting, out-of-scope request, request about the form of the
-  previous answer).
+- not_applicable: the question needs no documentation (greeting, thanks, out-of-scope request).
+When the last message asks to rework the previous answer ("remove document X", "shorter", "in English"), judge the
+passages against the question that answer addressed.
 Write the rationale in English, in one or two sentences, naming what is missing, if anything.""",
         feedback_value_type=Literal["full", "partial", "none", "not_applicable"],
         model=trace.info.tags.get("judge_model") or None)
@@ -570,12 +578,9 @@ def corpus_search(query: str) -> list:
 
 
 def search_query(messages: list) -> str:
-    """Question used by the independent search: the last user message, preceded by the previous one when it is a short
-    follow-up ("same for requirement X")."""
-    users = [m["content"] for m in messages if m["role"] == "user"]
-    if not users:
-        return ""
-    return "\n".join(users[-2:]) if len(users) > 1 and len(users[-1]) < 120 else users[-1]
+    """Question used by the independent search: the last two user messages, so that a follow-up ("same for requirement
+    X", "remove document Y") is searched with the question it refers to."""
+    return "\n".join([m["content"] for m in messages if m["role"] == "user"][-2:])
 
 # ── Numeric form of a verdict: 1 = pass, 0 = fail, 0.5 = partial; counts and durations as is; NULL for labels ──
 SCORE_VALUES = {"yes": 1.0, "no": 0.0, "true": 1.0, "false": 0.0, "full": 1.0, "partial": 0.5, "none": 0.0,

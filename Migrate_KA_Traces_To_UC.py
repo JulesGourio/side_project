@@ -161,10 +161,11 @@ for prefix in TO_MIGRATE:
     except Exception as e:
         print(f"{prefix}: count failed ({str(e)[:150]})")
 
-skipped = spark.sql(f"SHOW TABLES IN {TRACES_CATALOG}.{TRACES_SCHEMA} LIKE '*migration_skipped*'").collect()
+skipped = spark.sql(f"SELECT table_name FROM {TRACES_CATALOG}.information_schema.tables "
+                    f"WHERE table_schema = '{TRACES_SCHEMA}' AND table_name LIKE '%migration_skipped%'").collect()
 for t in skipped:
-    print(f"⚠️ skipped traces are listed in {TRACES_CATALOG}.{TRACES_SCHEMA}.{t.tableName}")
-    display(spark.table(f"{TRACES_CATALOG}.{TRACES_SCHEMA}.{t.tableName}").limit(20))
+    print(f"⚠️ skipped traces are listed in {TRACES_CATALOG}.{TRACES_SCHEMA}.{t.table_name}")
+    display(spark.table(f"{TRACES_CATALOG}.{TRACES_SCHEMA}.{t.table_name}").limit(20))
 
 if failures:
     raise RuntimeError(f"Migration failed for: {list(failures)}")

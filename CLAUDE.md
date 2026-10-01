@@ -56,7 +56,7 @@
 - Dashboard data: documented Unity Catalog tables in `uat_proj.qualibot`, no view (user decision; catalogue in
   `README.md`, "Dashboard data"); rows are replaced by key (`message_id` in production, `run_id` in evaluation);
   evaluation rows carry their run context (start time, subset, scorer configuration) so no join is needed.
-- Judge pacing: 70% (`JUDGE_RATE_SHARE`) of the judge model's limits (200k input / 20k output tokens per minute),
+- Judge pacing: `judge_rate_share` (widget, 0.7 by default) of the judge model's limits (200k input / 20k output tokens per minute),
   measured with the tokens the judge model reports in each assessment's metadata (`mlflow.assessment.judgeInputTokens`
   / `judgeOutputTokens`, also used for costs and written in the tables). Production scores batches of about one minute of that budget, writes
   each batch, stops starting batches after `max_run_minutes` (turns left go to the next run) and slows down after a
@@ -82,7 +82,10 @@
 - Resources are defined per target (`qualibot-uat`, `qualibot-prod`) with `run_as` the target's service principal.
 - Job names follow `D_<n>_<name>-${bundle.target}`; tags `project`, `activity-type`, `job-purpose`; CoreAdmin and
   CoreDev groups get CAN_MANAGE.
-- Classic single-node clusters: `SINGLE_USER`, `ON_DEMAND`, no `policy_id` (org policies force spot).
+- Classic single-node clusters: `SINGLE_USER`, single-node `spark_conf` and `ResourceClass` tag. The "Job Compute" policies
+  (`1. Job Compute XS`: single node, `.large` nodes, `auto:latest-lts`) set `SPOT_WITH_FALLBACK` with `first_on_demand: 1`,
+  so a single node (the driver) stays on demand. The scoring job uses `1. Job Compute XS` through a bundle variable
+  lookup (`job_compute_xs_policy_id`); the job identity needs CAN_USE on the policy.
 - Notebooks are deployed with `source: WORKSPACE` and paths relative to the resource file.
 
 ## Technical rules learned the hard way
@@ -106,7 +109,13 @@
   (turn not scored). Variable-length data (document lists, next user message, errors) goes to the trace step
   `answer_context` (`record_answer_context`), which the scorers read.
 - `relevance` and `answer_type` must not judge language, facts or evidence.
+- `databricks-gpt-6-luna` does not support batch inference (`ai_query` fails with PERMISSION_DENIED): the golden
+  dataset builder calls the endpoint directly from the driver (`llm()`: one call per distinct prompt, `LLM_WORKERS` in
+  flight, paced on `LLM_RATE_SHARE` of the token limits, 429 retried) and writes each step to the cache by parts of
+  `LLM_KEYS_PER_WRITE` rows, so an interrupted step resumes. Embeddings still use `ai_query`.
 - Reading traces stored in Unity Catalog requires `MLFLOW_TRACING_SQL_WAREHOUSE_ID`.
+- Golden dataset builder cache: every LLM or retrieval step declares the columns it reads (`depends_on`) and its prompt
+  (`config`); a row is recomputed when missing, failed or stale. Only `ka_fresh` (assistant answers) needs `FORCE`.
 - An MLflow experiment's parent folder must exist (`w.workspace.mkdirs`).
 - Document codes: compare with a key insensitive to language suffix (`_FR`, `.FR`, `_GB`, `_BG`…), separators, case
   and zero padding (`IN_APO_006` = `IN_APO_0006`, a typo present inside some documents). Codes ending with letters
@@ -129,9 +138,9 @@
 | Component | State |
 |---|---|
 | Trace migration (`D_2_qualibot-traces-sync`) | Deployed in UAT. Manual runs: `trace_test`, then `trace_ka_all_v2`, then `trace_ka_is_v2,trace_ka_as_v2`. Schedule to unpause with `to_migrate: "*"` once validated. |
-| Production scoring (`D_3_qualibot-quality-scoring`) | Registered MLflow scorers (about 8 judge calls per turn), tables `chat_quality_*` (no view); failure e-mail configured, quality alerts e-mailed only once `fail_on_alert` is "true" ("false" for now); tested end to end locally, not yet run in Databricks. Test run on 20 turns done in UAT; `reset_outputs=true` replaces the tables only once the new scores are written. Three 20-turn runs reviewed with the user; the third one is validated (20/20 scored, no scorer error, every bad verdict traced to a real assistant error). Judges now read the passages the assistant retrieved (from its trace), `retrieval_quality` and `compliance_claim` added, `error_source` (retrieval / generation), measured judge tokens and costs, Luna 6, batches paced on the judge limits and written one by one, time budget `max_run_minutes`, legacy views dropped by the job: tested locally only. Next: run with `dry_run=true`, then `reset_outputs=true`, `test_limit=20`; check the "Assistant traces" cell (retrieval steps found?) and the verdicts; then score the backlog and unpause the schedule. |
+| Production scoring (`D_3_qualibot-quality-scoring`) | Registered MLflow scorers (about 8 judge calls per turn), tables `chat_quality_*` (no view); failure e-mail configured, quality alerts e-mailed only once `fail_on_alert` is "true" ("false" for now); tested end to end locally, not yet run in Databricks. Test run on 20 turns done in UAT; `reset_outputs=true` replaces the tables only once the new scores are written. Three 20-turn runs reviewed with the user; the third one is validated (20/20 scored, no scorer error, every bad verdict traced to a real assistant error). Judges now read the passages the assistant retrieved (from its trace), `retrieval_quality` and `compliance_claim` added, `error_source` (retrieval / generation), measured judge tokens and costs, Luna 6, batches paced on the judge limits and written one by one, time budget `max_run_minutes`, legacy views dropped by the job: tested locally only. First UAT run with the assistant's passages (20 turns): every assistant trace resolved (chat_messages trace_id = MLflow `tr-…` id), 2 retrieval steps and 10-14 passages per turn, evidence from the assistant's retrieval for 20/20, no scorer error; 1 good / 10 acceptable / 9 bad, error_source generation 19/20, retrieval_quality sufficient 10, documentation_gap 8, retrieval_miss 1; about 60k input and 2.7k output judge tokens per turn (8.8 calls), $0.007 per turn, 20 turns in 9 minutes (input limit binding: about 2.3 turns per minute, about 225 turns per 100-minute run). Verdicts reviewed: the 9 bad are real assistant errors (7 compliance answers asserting "Oui, Latécoère répond" beyond the evidence, GO-1508 said to make the inspector close the NCR, P0289MI given instead of P0053MI); most acceptable verdicts came from status labels ("Courant") of the closing sources table, now ignored by `groundedness` unless the evidence shows the document cancelled or replaced. `retrieval_quality` judged a rework request ("remove Q0451MQ") as not applicable: it now judges the question the previous answer addressed, and the independent search uses the last two user messages. A retrieval miss now always counts in `error_source`. Re-run on 20 turns with these refinements: 2 good / 12 acceptable / 6 bad, answer types answered_full 11, answered_partial 6, not_found 2, clarification_request 1; retrieval_quality documentation_gap 10, sufficient 7, retrieval_miss 2, not_applicable 1; error_source generation 16, retrieval 2; 8.6 judge calls and $0.006 per turn, 20 turns in 7 minutes. Acceptable verdicts reviewed: mostly `partially_supported` on paraphrases or abbreviated titles (now: judge meaning, not wording; lower only for a claim that matters — value, rule, role, scope, condition, document identity); a clarification request to the one-word question "test" was a false `missed_answer_in_sources` (a genuinely ambiguous request is no longer a miss). Bad verdicts confirmed (APO glossary not retrieved, English versions not retrieved, GO-1508 misread, test-strap department not in the documents, P0289MI instead of P0053MI). The job runs on a classic single-node job cluster with the policy `1. Job Compute XS` (mlflow installed as a job library). First run on this cluster: 30 turns (the 30 most recent: a `test_limit` was still set), 13 minutes, no error, the assistant's retrieval found for 30/30, one judge configuration; AS assistant (`ka-3a7e9255`) bad rate 69% (9 unsupported compliance claims out of 13 turns), ALL assistant 24%; `compliance_claim` never `evidence_based` when applicable; no user vote among these turns. `n_turns_left` now counts every turn still waiting (it only counted the turns loaded by the run). MLflow run metrics `<scorer>/mean` are logged over the whole run at the end (mlflow.genai.evaluate logs them per batch, so its values covered the last batch only); the notebook header documents every run metric and the verdict rules. Job defaults: `max_run_minutes=330` (task timeout 6 h; a scheduled run ends in minutes), widget `judge_rate_share` (0.7; 0.9 for a backlog). Next: score the backlog with `test_limit` empty (`reset_outputs=false`, `rescore_changed_config=true`, `max_run_minutes=100`), then unpause the schedule. |
 | Evaluation notebook | Shared scorers with monitoring, every scorer registered, dataset linked to every run, tables `ka_eval_*` (no view); tested end to end locally, not yet run in Databricks. |
-| Golden dataset builder | 20-30 cases, compliance-matrix quota, neighbour expansion by `chunk_index`, flat table `ka_eval_golden_cases`; reuses the existing cache; not yet run in Databricks. |
+| Golden dataset builder | 20-30 cases, compliance-matrix quota, neighbour expansion by `chunk_index`, flat table `ka_eval_golden_cases`; reuses the existing cache; not yet run in Databricks. Judge model called directly (no batch inference for Luna 6), steps written by parts. `ka_fresh` asks the assistant for its trace: the documents it retrieved feed the evidence pool (origin `assistant_retrieval`) and give `ka_failure_stage` (retrieval: none of the expected documents retrieved / generation / unknown) for the cases it fails. Production failures are selected by stage: slots `production_retrieval_miss` (3), `production_compliance_claim` (3), `production_failure` (4), from `chat_quality_scores`. No cap on the generators' context (every chunk graded 2 or 3) and no truncation of messages or answers in the prompts. Compliance questions: generation rule and exported guideline `COMPLIANCE_GUIDELINE` (cite the documents addressing the requirement, never assert compliance beyond them). First run with these changes: the assistant returned its trace for 36/36 shortlisted cases; final selection 25 cases (19 log, 1 override, 5 synthetic), assistant verdicts partially_correct 16, incorrect 6, correct 1, unjustified_refusal 1, justified_refusal 1; answerability partial 12, full 7, none 4, out_of_scope 2. Too few cases the assistant passes (MIN_KA_OK = 8): slot `production_pass` (6) added, from turns the production scoring judged good and nobody voted down; the selection now warns when a minimum is not reached. Review of that selection (25 cases, 21 exported) with the user: see "Findings from the golden dataset review". Changes: every cached step records a fingerprint of its inputs and prompt and is recomputed when they change (the first build had kept evidence pooled before the assistant-retrieval and hypothetical-answer routes); intents `requirement_compliance` taken from the production scoring when it scored the turn; process sheets named by their code (S40 → PRO-S40, P28 → PROLAT_P28) pooled; grading counts an excerpt answering one part of a multi-part question; facts in English, never about the excerpts (also filtered at export), never restating human expectations; plain codes (no `REF:` prefix); verdicts on content only (unverifiable details are not errors unless they are the core of the answer); at most 4 refusal cases, at least 5 compliance questions, passes = correct or justified refusal; section 10 prints the agreement with the production verdicts, and `ka_eval_golden_cases` has `ka_log_verdict` and `production_verdict`. Tested locally only. Next: after the D_3 backlog, rerun sections 0-10 with `FORCE = set()` (first run recomputes every step once: about 1-2 h, a few dollars), review in section 11, export. |
 
 ### Findings from the first evaluation run (25 cases, qualibot_ALL_v2)
 - The raw correctness score (44%) underestimated the assistant: about a third of the failures came from the
@@ -155,6 +164,17 @@
 - Frequent warnings: answers that leave out details the cited documents contain (repair case of NCR closure, LBG listed
   among the applicable sites), and an English answer to a Bulgarian question.
 
+### Findings from the golden dataset review (25 cases built before the fingerprinted cache)
+- No compliance-matrix question at all (about half of the production traffic): annotations cached before the intent
+  existed. Refusal cases 6/21 exported (29%), cases the assistant passes 2/21: the dataset measured failures only.
+- None of its logged answers was scored in production (only the 30 most recent turns were): no agreement measurable.
+- Verdicts too harsh: 16 `partially_correct`, often for details the builder's excerpts could not verify (the assistant
+  read other passages) or for form (citation style, language). Facts written in French, some duplicated with the human
+  facts (CMP, APO), some about the excerpts themselves ("the sequence is not in the excerpts"), `REF:` prefixes in
+  expected sources.
+- Evidence gaps: process codes not resolved to process sheets (S40/P28 judged "not in the documentation" although the
+  assistant retrieved PRO-S40), documents named in a comparison graded irrelevant (NF-10845).
+
 ### Findings from the load tests (one question, ALL assistants)
 - `ka-7679a56e-endpoint`: HTTP 429 from 10 requests in flight (23/60 at 10, 29/60 at 30), no `Retry-After` header;
   silent retrieval failures (HTTP 200, empty retrieval step) from 10 in flight (1/60 at 10, 7/60 at 30).
@@ -169,9 +189,6 @@
 - Expert: margin rate applied in inter-site invoicing (P&L LEAP case).
 - Is there a document metadata table (title, language, status current/obsolete), e.g. from the parsing pipeline? Titles
   are otherwise only in the `chunk_text` header of `chunks_v1`.
-- Exact name of the Luna 6 serving endpoint (set to `databricks-gpt-6-luna`; the run stops with an explicit error if
-  it is wrong) and whether the assistants' trace ids of `chat_messages` resolve with `mlflow.get_trace` (the
-  "Assistant traces" cell of the scoring notebook shows it).
 - Errors of the D_2 and D_3 runs (the user will send them).
 - Knowledge Assistant experiments may offer a native "Delta sync" trace archival option; if available, it could replace
   the nightly migration job for new traces.
@@ -180,9 +197,7 @@
 1. Run the production scoring (see Delivered) and check the Traces, Judges and Runs tabs of
    `/Shared/qualibot-quality-scoring` and the tables of `uat_proj.qualibot`; build the dashboard on the tables
    (`README.md`, "Dashboard data").
-2. Run `Build_Golden_Dataset.py` with `FORCE = {"reformulations", "evidence_pool", "ka_fresh"}` to benefit from the
-   retrieval routes (hypothetical answer, current assistant sources, similar and adjacent chunks), review in section 11,
-   export 20-30 cases.
+2. After the D_3 backlog, run `Build_Golden_Dataset.py` sections 0-10 with `FORCE = set()` (stale steps are recomputed automatically), check the compliance count and the production agreement printed in section 10, review in section 11 (cases 1379, 2913, 411, 3251 in particular), export 20-30 cases.
 3. Run `Evaluate_Knowledge_Assistant.py` (`sample_n=5`, then full), rate 10+ answers in "Human labels", check agreement,
    and align `fact_coverage` once 10+ ratings exist.
 4. Improve the assistant's retrieval of acronyms and document types (expanded acronyms and full titles in chunk text,

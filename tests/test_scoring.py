@@ -76,9 +76,9 @@ class Spark:
         return FakeDF(pdf, columns=["id", "trace_id", "content"])
     def sql(self, q, *a):
         sql.run(q)
-        if q.startswith("SHOW VIEWS"):
-            return types.SimpleNamespace(collect=lambda: [{"viewName": "v_chat_quality_daily", "isTemporary": False},
-                                                          {"viewName": "other_view", "isTemporary": False}])
+        if "information_schema.views" in q:
+            return types.SimpleNamespace(collect=lambda: [{"table_name": "v_chat_quality_daily"},
+                                                          {"table_name": "other_view"}])
         if "AS bad_rate" in q and q.lstrip().startswith("SELECT"):
             return FakeDF(pd.DataFrame({"endpoint_name": ["ka-7679a56e-endpoint"] * 5, "day": pd.date_range("2026-09-17", periods=5),
                                         "n": [20, 20, 20, 20, 20], "bad_rate": [0.1, 0.1, 0.1, 0.1, 0.6]}))
@@ -146,6 +146,9 @@ if not DRY:
     assert ev.loc["4", "retrieval_quality"] == "retrieval_miss" and "retrieval_miss" in ev.loc["4", "failure_reasons"]
     assert ev.loc["2", "error_source"] == "generation" and ev.loc["4", "error_source"] == "retrieval"
     assert ev["judge_input_tokens"].min() > 0
+    compliance_turn = {"answer_type": "answered_full", "question_intent": "requirement_compliance", "relevance": "yes",
+                       "groundedness": "not_supported", "retrieval_quality": "retrieval_miss", "citation_count": 2}
+    assert ns["turn_verdict"](compliance_turn)[::2] == ("bad", "retrieval_and_generation")
     if RESET:
         assert all(len(r) == n and not any(x.get("stale") for x in r) for r, n in
                    [(sql.tables["uat_proj.qualibot.chat_quality_scores"], 4), (sql.tables["uat_proj.qualibot.chat_quality_scoring_runs"], 1)])
@@ -166,6 +169,11 @@ if not DRY:
     run = mlflow.get_run(ns["MLFLOW_RUN_ID"])
     print("dataset input:", [d.dataset.name for d in run.inputs.dataset_inputs])
     print("metrics:", {k: v for k, v in run.data.metrics.items() if k.startswith(("run/bad", "reason/", "bad_rate"))})
+    a_rows = pd.DataFrame(sql.tables["uat_proj.qualibot.chat_quality_assessments"])
+    expected = a_rows[a_rows["assessment_name"] == "groundedness"]["value_numeric"].astype(float).mean()
+    assert abs(run.data.metrics["groundedness/mean"] - expected) < 1e-3, (run.data.metrics.get("groundedness/mean"), expected)
+    assert "turn_verdict/mean" in run.data.metrics
+    print("scorer means over the whole run: ok")
     assert not LEAKS, f"next user message visible to: {sorted(set(LEAKS))}"
     print("next user message hidden from the other judges: ok")
     print("judge calls by name:", pd.Series([c[0] for c in calls]).value_counts().to_dict())

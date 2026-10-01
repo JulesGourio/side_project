@@ -29,9 +29,17 @@
 # MAGIC | `compliance_claim` ¹ | LLM judge on the evidence | evidence_based / unsupported_compliance_claim / not_applicable | every turn |
 # MAGIC | `reference_integrity` ¹, `citation_count` | code | every cited code exists; number of sources | every turn |
 # MAGIC
-# MAGIC ¹ identical in the evaluation notebook. The rule-based **turn verdict** (`good` / `acceptable` / `bad`) combines the
-# MAGIC scorers into `failure_reasons` and the stage at fault, `error_source`: **retrieval** (the index holds what the
-# MAGIC assistant did not retrieve) or **generation** (the model misused or went beyond what it retrieved).
+# MAGIC ¹ identical in the evaluation notebook.
+# MAGIC
+# MAGIC ### Turn verdict
+# MAGIC The rule-based **turn verdict** combines the scorers: `bad` when one of the first reasons applies, `acceptable` when
+# MAGIC only the second ones do, `good` otherwise. `error_source` gives the stage at fault: **retrieval** (the index holds
+# MAGIC what the assistant did not retrieve) or **generation** (the model misused or went beyond what it retrieved).
+# MAGIC
+# MAGIC | Verdict | Failure reasons |
+# MAGIC |---|---|
+# MAGIC | `bad` | `unsupported_claims` (a key claim contradicted by, or absent from, what the assistant retrieved), `unsupported_compliance_claim`, `missed_answer_in_sources` ("not found" although the passages hold it), `retrieval_miss` (on a "not found", partial or clarification answer), `off_topic`, `wrongful_refusal`, `empty_or_error`, `unsafe` |
+# MAGIC | `acceptable` | `partially_supported_claims`, `missed_information` (a detail the passages hold is left out), `retrieval_miss` (on a full answer), `incomplete`, `unverified_reference`, `language_mismatch`, `no_citation`, `user_complaint`, `user_rephrased` |
 # MAGIC
 # MAGIC ### Outputs
 # MAGIC | Where | Content |
@@ -41,8 +49,26 @@
 # MAGIC | `chat_quality_scoring_runs` | one row per run: volumes, rates, cost, turns left |
 # MAGIC | MLflow experiment | Runs (one per scoring run), Traces (one per turn, grouped by conversation), Judges (every scorer, not scheduled) |
 # MAGIC
+# MAGIC ### Metrics of an MLflow run
+# MAGIC | Metric | Meaning |
+# MAGIC |---|---|
+# MAGIC | `run/n_messages`, `run/n_turns_left` | Turns scored by the run; turns still waiting for the next runs |
+# MAGIC | `run/good_rate`, `run/bad_rate`, `run/refusal_rate` | Share of good and bad verdicts; share of "not found" and out-of-scope answers |
+# MAGIC | `run/groundedness_rate`, `run/grounding_coverage` | Share of answers fully supported by their evidence; share of answers with evidence |
+# MAGIC | `run/assistant_retrieval_coverage` | Share of turns whose evidence is the assistant's own retrieval |
+# MAGIC | `run/retrieval_miss_rate` | Share of turns where the index held more than the assistant retrieved |
+# MAGIC | `run/n_judge_calls`, `run/judge_input_tokens`, `run/judge_output_tokens`, `run/judge_cost_usd` | Judge usage and cost |
+# MAGIC | `run/n_judge_errors`, `run/n_voted`, `run/n_needs_human_review`, `run/duration_s` | Turns with a scorer error; turns with a user vote; turns queued for human review; duration |
+# MAGIC | `<scorer>/mean` | Mean over the run: 1 = pass, 0 = fail, 0.5 = partial (`missed_answer`: 1 = nothing missed; `citation_count`: sources per answer; `turn_verdict`: good 1, acceptable 0.5, bad 0) |
+# MAGIC | `reason/<reason>` | Turns with each failure reason |
+# MAGIC | `error_source/<stage>` | Turns whose verdict comes from retrieval, generation or both |
+# MAGIC | `bad_rate/<endpoint>` | Bad-verdict rate of each assistant |
+# MAGIC
+# MAGIC In the experiment's run table, a metric that a run did not produce shows "-" (for instance a failure reason that
+# MAGIC did not occur).
+# MAGIC
 # MAGIC ### Operations
-# MAGIC - Judge calls are paced to use `JUDGE_RATE_SHARE` of the judge model's token limits, measured with the tokens the
+# MAGIC - Judge calls are paced to use `judge_rate_share` of the judge model's token limits, measured with the tokens the
 # MAGIC   model reports. Turns are scored in batches of about one minute of that budget and written after each batch; no
 # MAGIC   batch starts after `max_run_minutes`, and the turns left are scored by the next run.
 # MAGIC - The run stops if the judge model (`judge_endpoint`) does not answer.
@@ -101,7 +127,8 @@ dbutils.widgets.text("source_schema", "uat_landingzone.qualibot")               
 dbutils.widgets.text("output_schema", "uat_proj.qualibot")                        # output tables
 dbutils.widgets.text("experiment_path", "/Shared/qualibot-quality-scoring")
 dbutils.widgets.text("judge_endpoint", "databricks-gpt-6-luna")                   # judge model serving endpoint
-dbutils.widgets.text("max_run_minutes", "100")      # time budget: no new batch of turns starts after it (backlog absorbed over runs)
+dbutils.widgets.text("max_run_minutes", "330")      # time budget: no new batch of turns starts after it (backlog absorbed over runs)
+dbutils.widgets.text("judge_rate_share", "0.7")     # share of the judge model's token limits used by this run (0.9 for a backlog)
 
 TEST_LIMIT = int(dbutils.widgets.get("test_limit")) if dbutils.widgets.get("test_limit").strip() else None
 DRY_RUN = dbutils.widgets.get("dry_run") == "true"
@@ -113,7 +140,8 @@ SOURCE_SCHEMA = dbutils.widgets.get("source_schema").strip()
 OUTPUT_SCHEMA = dbutils.widgets.get("output_schema").strip()
 EXPERIMENT_PATH = dbutils.widgets.get("experiment_path").strip()
 JUDGE_ENDPOINT = dbutils.widgets.get("judge_endpoint").strip()
-MAX_RUN_MINUTES = float(dbutils.widgets.get("max_run_minutes") or 100)
+MAX_RUN_MINUTES = float(dbutils.widgets.get("max_run_minutes") or 330)
+JUDGE_RATE_SHARE = min(max(float(dbutils.widgets.get("judge_rate_share") or 0.7), 0.05), 0.95)
 
 SOURCE_TABLE = f"{SOURCE_SCHEMA}.chat_messages"
 FEEDBACK_TABLE = f"{SOURCE_SCHEMA}.chat_feedbacks"            # optional: used if it exists
@@ -138,7 +166,6 @@ CORPUS_SEARCH_RESULTS = 10             # chunks of the independent search of the
 # ── Judge model rate limits (pay-per-token endpoint, shared with every other use of the model) ──
 JUDGE_INPUT_TOKENS_PER_MINUTE = 200_000
 JUDGE_OUTPUT_TOKENS_PER_MINUTE = 20_000
-JUDGE_RATE_SHARE = 0.7                 # share of the limits used by this job; the rest stays available to other uses
 JUDGE_MAX_RETRIES = 7                  # retries of a call rejected for rate limit (1 s, 2 s … 60 s: about 2 minutes)
 # The request limits (1,000 per second, 360,000 per hour) are far above the calls of this job. The pacing uses the
 # tokens reported by the judge model for each call.
@@ -283,7 +310,12 @@ Return:
         instructions="""You verify an answer of an assistant on aerospace quality documentation. {{ inputs }} holds the
 conversation (the last user message is the question) and the evidence; {{ outputs }} is the answer.
 List the answer's key factual claims (values, thresholds, deadlines, roles, steps, document identities, definitions,
-compliance statements), ignoring greetings, generic advice and questions to the user.
+compliance statements), ignoring greetings, generic advice and questions to the user. In a closing table of sources,
+check the document codes and titles, but not the status or version labels ("current", "Courant", "—"): they are not
+claims to verify, unless the evidence shows the document is cancelled, replaced or obsolete, which contradicts them.
+Judge meaning, not wording: a faithful paraphrase, a summary, a heading or an abbreviated title is supported. Lower the
+verdict only for a claim that matters to the user (value, rule, role, scope, condition, document identity) and is
+wrong, overstated or only partly right.
 """ + scope + """
 Write the rationale in English and name the unsupported claims, if any.""",
         feedback_value_type=Literal["supported", "partially_supported", "not_supported"],
@@ -311,7 +343,9 @@ def missed_answer(inputs, outputs, trace):
         instructions="""{{ inputs }} holds a conversation with an assistant on quality documentation (the last user
 message is the question) and passages of quality documents; {{ outputs }} is the assistant's answer. Return yes if the
 answer says the information is not available, or leaves a part of the question unanswered, while the passages DO
-contain that information; otherwise return no. In the rationale (English), state what was missed, if anything.""",
+contain that information; otherwise return no. Asking the user to clarify a genuinely ambiguous request (a word or two
+that could refer to many documents) is not a miss; leaving out a detail that the question does not ask for is not a
+miss either. In the rationale (English), state what was missed, if anything.""",
         feedback_value_type=Literal["yes", "no"],
         model=trace.info.tags.get("judge_model") or None)
     return judge(inputs={"messages": inputs["messages"], "evidence": evidence}, outputs=outputs)
@@ -349,8 +383,9 @@ information needed to answer the question?
 - full: everything the question asks is in the passages;
 - partial: only part of it;
 - none: nothing relevant;
-- not_applicable: the question needs no documentation (greeting, out-of-scope request, request about the form of the
-  previous answer).
+- not_applicable: the question needs no documentation (greeting, thanks, out-of-scope request).
+When the last message asks to rework the previous answer ("remove document X", "shorter", "in English"), judge the
+passages against the question that answer addressed.
 Write the rationale in English, in one or two sentences, naming what is missing, if anything.""",
         feedback_value_type=Literal["full", "partial", "none", "not_applicable"],
         model=trace.info.tags.get("judge_model") or None)
@@ -609,12 +644,9 @@ def corpus_search(query: str) -> list:
 
 
 def search_query(messages: list) -> str:
-    """Question used by the independent search: the last user message, preceded by the previous one when it is a short
-    follow-up ("same for requirement X")."""
-    users = [m["content"] for m in messages if m["role"] == "user"]
-    if not users:
-        return ""
-    return "\n".join(users[-2:]) if len(users) > 1 and len(users[-1]) < 120 else users[-1]
+    """Question used by the independent search: the last two user messages, so that a follow-up ("same for requirement
+    X", "remove document Y") is searched with the question it refers to."""
+    return "\n".join([m["content"] for m in messages if m["role"] == "user"][-2:])
 
 # ── Numeric form of a verdict: 1 = pass, 0 = fail, 0.5 = partial; counts and durations as is; NULL for labels ──
 SCORE_VALUES = {"yes": 1.0, "no": 0.0, "true": 1.0, "false": 0.0, "full": 1.0, "partial": 0.5, "none": 0.0,
@@ -938,7 +970,8 @@ REASON_STAGE = {"retrieval_miss": "retrieval",
 
 def turn_verdict(v: dict) -> tuple:
     """(verdict, failure_reasons, error_source) from the scorer values. bad = the user was badly served; acceptable =
-    minor issue; error_source = retrieval, generation or retrieval_and_generation, from the reasons of the verdict."""
+    minor issue; error_source = retrieval, generation or retrieval_and_generation, from the reasons of the verdict (a
+    retrieval miss always counts: the index held what the assistant did not retrieve)."""
     bad, warn = [], []
     at, intent = v.get("answer_type"), v.get("question_intent")
     if v.get("safety") == "no":
@@ -979,6 +1012,8 @@ def turn_verdict(v: dict) -> tuple:
     elif v.get("user_reaction") == "rephrase_same_question":
         warn.append("user_rephrased")
     stages = {REASON_STAGE[r] for r in (bad or warn) if r in REASON_STAGE}
+    if "retrieval_miss" in warn:                          # what the assistant got wrong, the index held
+        stages.add("retrieval")
     source = "retrieval_and_generation" if len(stages) > 1 else next(iter(stages), None)
     return ("bad" if bad else "acceptable" if warn else "good"), bad + warn, source
 
@@ -1082,11 +1117,13 @@ if SAMPLE_RATE < 1.0:
     df_pairs = df_pairs.filter((F.abs(F.hash(F.col("message_id").cast("string"))) % 1000) < int(SAMPLE_RATE * 1000))
 
 cap = TEST_LIMIT or MAX_TURNS_PER_RUN
+TURNS_WAITING = df_pairs.count()                  # every turn still to score, before the cap of this run
 df_pairs = df_pairs.orderBy(F.col("created_at").desc()).limit(cap)
 MESSAGE_ID_TYPE = df_pairs.schema["message_id"].dataType
 CREATED_AT_TYPE = df_pairs.schema["created_at"].dataType
 pdf_pairs = df_pairs.toPandas()
-print(f"{len(pdf_pairs)} assistant turn(s) to score (cap {cap}).")
+print(f"{TURNS_WAITING} assistant turn(s) waiting to be scored · {len(pdf_pairs)} loaded by this run "
+      f"({'test_limit' if TEST_LIMIT else 'cap'} {cap}).")
 
 # COMMAND ----------
 
@@ -1506,7 +1543,7 @@ RUNS_COLUMNS = [
     ("judge_user_agreement", D, "Agreement between the verdict (bad / not bad) and the user votes"),
     ("n_voted", I, "Scored turns with a user vote"),
     ("n_needs_human_review", I, "Turns added to the human review queue"),
-    ("n_turns_left", I, "Turns left for the next run when the time budget was reached"),
+    ("n_turns_left", I, "Turns still waiting to be scored after this run (time budget, test_limit or cap reached)"),
 ]
 RUNS_SCHEMA = StructType([StructField(n, t) for n, t, _ in RUNS_COLUMNS])
 RUNS_DOCS = {n: d for n, _, d in RUNS_COLUMNS}
@@ -1629,7 +1666,7 @@ else:
             write_turns(rows, a_rows)
             records += rows
             assessment_rows += a_rows
-            run_row = write_run(pd.DataFrame(records), len(pending))
+            run_row = write_run(pd.DataFrame(records), TURNS_WAITING - len(records))
             # Pacing: the batch lasts as long as its measured usage takes of the limits; slower after a rejection
             pace = min(pace * 1.5, 4.0) if rate_limited(a_rows) else max(1.0, pace / 1.2)
             batch_usage = [(r["n_judge_calls"], r["judge_input_tokens"], r["judge_output_tokens"]) for r in rows]
@@ -1643,7 +1680,9 @@ else:
             wait = minutes_of_limits(batch_usage) * 60 * pace - (time.time() - b_start)
             if pending and wait > 0:
                 time.sleep(wait)
-    left = f" · {len(pending)} turn(s) left for the next run (time budget reached)" if pending else ""
+    left = (f" · {TURNS_WAITING - len(records)} turn(s) left for the next runs"
+            + (" (time budget reached)" if pending else " (test_limit or cap reached)" if TURNS_WAITING > len(TURNS) else "")
+            if TURNS_WAITING > len(records) else "")
     print(f"{len(records)}/{len(TURNS)} turns scored in {time.time() - t_start:.0f} s · run {MLFLOW_RUN_ID}{left}")
 
 df_final = pd.DataFrame(records)
@@ -1698,13 +1737,19 @@ if run_row:
         mlflow.log_metrics({f"error_source/{k}": int(v) for k, v in df_final["error_source"].value_counts().items()})
         by_agent = df_final.groupby("endpoint_name")["turn_verdict"].apply(lambda s: float((s == "bad").mean()))
         mlflow.log_metrics({f"bad_rate/{k}": v for k, v in by_agent.items()})
+        # Mean of every scorer over all the turns of the run (numeric form: 1 = pass, 0 = fail, 0.5 = partial), logged
+        # last: mlflow.genai.evaluate logs <scorer>/mean for each batch, so its own value covers the last batch only
+        scored = pd.DataFrame(assessment_rows)
+        means = scored[scored["value_numeric"].notna()].groupby("assessment_name")["value_numeric"].mean()
+        mlflow.log_metrics({f"{name}/mean": round(float(v), 4) for name, v in means.items()})
         worst = df_final[df_final["turn_verdict"] == "bad"].head(50)
         if len(worst):
             mlflow.log_table(worst[["message_id", "endpoint_name", "question_intent", "user_question", "answer",
                                     "failure_reasons", "error_source", "evidence_source", "groundedness__rationale",
                                     "missed_answer_detail", "retrieval_quality__rationale",
                                     "feedback_vote", "scoring_trace_id"]].astype(str), "worst_turns.json")
-    print(f"✓ MLflow run {MLFLOW_RUN_ID}: metrics run/*, reason/*, error_source/*, bad_rate/*, artifact worst_turns.json")
+    print(f"✓ MLflow run {MLFLOW_RUN_ID}: metrics run/*, <scorer>/mean, reason/*, error_source/*, bad_rate/*, "
+          f"artifact worst_turns.json")
 
 if FEEDBACK_TO_AGENT_TRACES and len(df_final):
     src = AssessmentSource(source_type=AssessmentSourceType.LLM_JUDGE, source_id=f"qualibot-quality-scoring/{JUDGE_CONFIG_ID}")
@@ -1726,10 +1771,12 @@ if FAIL_ON_ALERT and alerts:
 # DBTITLE 1,Output schema — the dashboard reads the tables: views over the quality outputs are dropped
 QUALITY_VIEW_PREFIXES = ("v_chat_quality_", "v_ka_eval_", "v_quality_shared_scorers")
 if not DRY_RUN:
-    for r in spark.sql(f"SHOW VIEWS IN {OUTPUT_SCHEMA}").collect():
-        if r["viewName"].startswith(QUALITY_VIEW_PREFIXES) and not r["isTemporary"]:
-            spark.sql(f"DROP VIEW IF EXISTS {OUTPUT_SCHEMA}.{r['viewName']}")
-            print(f"View dropped: {OUTPUT_SCHEMA}.{r['viewName']}")
+    _catalog, _schema = OUTPUT_SCHEMA.split(".", 1)
+    for r in spark.sql(f"SELECT table_name FROM {_catalog}.information_schema.views "
+                       f"WHERE table_schema = '{_schema}'").collect():
+        if r["table_name"].startswith(QUALITY_VIEW_PREFIXES):
+            spark.sql(f"DROP VIEW IF EXISTS {OUTPUT_SCHEMA}.{r['table_name']}")
+            print(f"View dropped: {OUTPUT_SCHEMA}.{r['table_name']}")
 
 # COMMAND ----------
 
