@@ -25,6 +25,7 @@
 | `utils/evaluation/Evaluate_Knowledge_Assistant.py` | Evaluates a Knowledge Assistant endpoint on the golden dataset with MLflow GenAI (traces, judges, report) |
 | `utils/quality_monitoring/Score_Production_QA.py` + `resources/quality_scoring.yml` | Twice-daily LLM-judge scoring of production turns (job `D_3_qualibot-quality-scoring`) |
 | `utils/evaluation/Load_Test_Knowledge_Assistant.py` | Load test of an assistant endpoint: one MLflow trace per request traced from the caller's side (429 in state ERROR, the assistant's own steps copied, empty retrieval marked ERROR), one child run per concurrency level, charts; tables `ka_load_test_*` |
+| `utils/lakebase_sync/Copy_Lakebase_To_UC.py` + `resources/lakebase_copy.yml` | Generic copy of every table of a Lakebase database into Unity Catalog Delta tables, created if missing (job `D_4_qualibot-lakebase-copy`, serverless) |
 | `utils/traces_migration/Migrate_KA_Traces_To_UC.py` + `resources/traces_migration.yml` | Nightly copy of the assistants' MLflow traces to Unity Catalog (job `D_2_qualibot-traces-sync`) |
 | `tests/` (this repository only) | Local end-to-end tests of the notebooks: real MLflow (SQLite), simulated judge model, Vector Search, assistant and Spark (see `README.md`, "Local tests") |
 
