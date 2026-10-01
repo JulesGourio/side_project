@@ -1,0 +1,7 @@
+asyncpg>=0.29.0
+databricks-sdk>=0.88.0
+httpx>=0.28.0
+pymupdf>=1.25.0
+Pillow>=11.0.0
+lxml>=5.0.0
+fasttext-wheel>=0.9.2

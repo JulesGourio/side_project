@@ -1,0 +1,211 @@
+/**
+ * DESIGN TOKENS
+ *
+ * This file contains static design tokens (not affected by theme changes):
+ * - Spacing, borders, shadows
+ * - Z-indexes, transitions, layout dimensions
+ * - Keyframe animations
+ *
+ * COLOR VARIABLES are set by ThemeContext at runtime from lib/themes.ts
+ */
+
+:root {
+  /* ============================================================
+   * COLOR FALLBACKS
+   * Minimal fallbacks for initial load before ThemeContext runs
+   * These are immediately overridden by ThemeContext
+   * ============================================================ */
+
+  /* Core colors (18 variables) - Latecoere aerospace branding */
+  --color-text-heading: #0C1C3E;
+  --color-text-primary: #1A2B4A;
+  --color-text-muted: #6B7B94;
+  --color-accent-primary: #0055A4;
+  --color-accent-secondary: #3378b8;
+  --color-bg-primary: #FFFFFF;
+  --color-bg-secondary: #F4F6F9;
+  --color-bg-tertiary: #EDF0F5;
+  --color-bg-elevated: #FFFFFF;
+  --color-border: #D5DBE5;
+  --color-success: #16A34A;
+  --color-error: #DC2626;
+  --color-info: #0055A4;
+  --color-warning: #D97706;
+  --color-animated-bg: rgba(12, 28, 62, 0.7);
+
+  /* Glass effect (for modals/popups) */
+  --color-glass-bg: rgba(255, 255, 255, 0.95);
+  --color-glass-border: rgba(228, 228, 231, 0.6);
+  --color-glass-backdrop: rgba(0, 0, 0, 0.4);
+
+  /* Tailwind/shadcn compatibility */
+  --color-primary: var(--color-accent-primary);
+  --color-primary-foreground: #ffffff;
+  --color-secondary: var(--color-bg-secondary);
+  --color-secondary-foreground: var(--color-text-primary);
+  --color-secondary-border: var(--color-border);
+  --color-foreground: var(--color-text-primary);
+  --color-background: var(--color-bg-primary);
+  --color-muted: var(--color-bg-tertiary);
+  --color-muted-foreground: var(--color-text-muted);
+  --color-accent: var(--color-bg-secondary);
+  --color-accent-foreground: var(--color-text-primary);
+  --color-ring: var(--color-accent-primary);
+  --color-destructive: var(--color-error);
+
+  /* ============================================================
+   * TYPOGRAPHY - Latecoere corporate fonts
+   * ============================================================ */
+  --font-heading: "Montserrat", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-body: "Open Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "Fira Code", monospace;
+
+  /* ============================================================
+   * SPACING
+   * ============================================================ */
+  --spacing-xs: 0.25rem;   /* 4px */
+  --spacing-sm: 0.5rem;    /* 8px */
+  --spacing-md: 1rem;      /* 16px */
+  --spacing-lg: 1.5rem;    /* 24px */
+  --spacing-xl: 2rem;      /* 32px */
+  --spacing-2xl: 3rem;     /* 48px */
+
+  /* ============================================================
+   * BORDERS
+   * ============================================================ */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-full: 9999px;
+
+  /* ============================================================
+   * SHADOWS
+   * ============================================================ */
+  --shadow-xs: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --shadow-sm: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px -1px rgba(0, 0, 0, 0.1);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1);
+  --shadow-xl: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+
+  /* ============================================================
+   * TRANSITIONS
+   * ============================================================ */
+  --transition-fast: 150ms ease;
+  --transition-base: 200ms ease;
+  --transition-slow: 300ms ease;
+
+  /* ============================================================
+   * Z-INDEX
+   * ============================================================ */
+  --z-dropdown: 50;
+  --z-modal: 100;
+  --z-popover: 200;
+  --z-tooltip: 300;
+
+  /* ============================================================
+   * LAYOUT
+   * ============================================================ */
+  --sidebar-width: 280px;
+  --header-height: 56px;
+}
+
+/* ============================================================
+ * HOME PAGE ANIMATIONS
+ * ============================================================ */
+
+/* Hero gradient orb pulsing */
+@keyframes galaxyPulse {
+  0%, 100% { transform: translate(-50%, -50%) scale(1); opacity: 0.10; }
+  50% { transform: translate(-50%, -50%) scale(1.08); opacity: 0.14; }
+}
+
+/* Floating particles - drift and twinkle */
+@keyframes particleDrift {
+  0%, 100% { transform: translate(0, 0); }
+  25% { transform: translate(6px, -8px); }
+  50% { transform: translate(-4px, 5px); }
+  75% { transform: translate(8px, 3px); }
+}
+
+@keyframes particleTwinkle {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 0.08; }
+}
+
+/* Scroll indicator bounce */
+@keyframes scrollBounce {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(6px); }
+}
+
+/* Broken connection line search animation */
+@keyframes lineSearch {
+  0%, 100% { opacity: 0.4; stroke-dashoffset: 0; }
+  50% { opacity: 0.1; stroke-dashoffset: 3; }
+}
+
+/* Fragment drift animations (9 variants for visual variety) */
+@keyframes fragmentDrift0 {
+  0%, 100% { transform: translate(-50%, -50%) translate(0, 0); }
+  50% { transform: translate(-50%, -50%) translate(3px, 5px); }
+}
+@keyframes fragmentDrift1 {
+  0%, 100% { transform: translate(-50%, -50%) translate(0, 0); }
+  50% { transform: translate(-50%, -50%) translate(-2px, 4px); }
+}
+@keyframes fragmentDrift2 {
+  0%, 100% { transform: translate(-50%, -50%) translate(0, 0); }
+  50% { transform: translate(-50%, -50%) translate(-4px, 3px); }
+}
+@keyframes fragmentDrift3 {
+  0%, 100% { transform: translate(-50%, -50%) translate(0, 0); }
+  50% { transform: translate(-50%, -50%) translate(3px, -4px); }
+}
+@keyframes fragmentDrift4 {
+  0%, 100% { transform: translate(-50%, -50%) translate(0, 0); }
+  50% { transform: translate(-50%, -50%) translate(-3px, 4px); }
+}
+@keyframes fragmentDrift5 {
+  0%, 100% { transform: translate(-50%, -50%) translate(0, 0); }
+  50% { transform: translate(-50%, -50%) translate(4px, -3px); }
+}
+@keyframes fragmentDrift6 {
+  0%, 100% { transform: translate(-50%, -50%) translate(0, 0); }
+  50% { transform: translate(-50%, -50%) translate(-2px, -3px); }
+}
+@keyframes fragmentDrift7 {
+  0%, 100% { transform: translate(-50%, -50%) translate(0, 0); }
+  50% { transform: translate(-50%, -50%) translate(-3px, -4px); }
+}
+@keyframes fragmentDrift8 {
+  0%, 100% { transform: translate(-50%, -50%) translate(0, 0); }
+  50% { transform: translate(-50%, -50%) translate(2px, 3px); }
+}
+
+/* Fragment rotation animations (9 variants) */
+@keyframes fragmentRotate0 { 0%, 100% { rotate: -1deg; } 50% { rotate: 1deg; } }
+@keyframes fragmentRotate1 { 0%, 100% { rotate: 1deg; } 50% { rotate: -1deg; } }
+@keyframes fragmentRotate2 { 0%, 100% { rotate: 1deg; } 50% { rotate: -1deg; } }
+@keyframes fragmentRotate3 { 0%, 100% { rotate: -1deg; } 50% { rotate: 1deg; } }
+@keyframes fragmentRotate4 { 0%, 100% { rotate: 1deg; } 50% { rotate: -1deg; } }
+@keyframes fragmentRotate5 { 0%, 100% { rotate: -1deg; } 50% { rotate: 1deg; } }
+@keyframes fragmentRotate6 { 0%, 100% { rotate: 1deg; } 50% { rotate: -1deg; } }
+@keyframes fragmentRotate7 { 0%, 100% { rotate: 1deg; } 50% { rotate: -1deg; } }
+@keyframes fragmentRotate8 { 0%, 100% { rotate: -1deg; } 50% { rotate: 1deg; } }
+
+/* ============================================================
+ * FOCUS STYLES
+ * ============================================================ */
+*:focus-visible {
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: 2px;
+}
+
+/* ============================================================
+ * SELECTION STYLES
+ * ============================================================ */
+::selection {
+  background-color: var(--color-accent-primary);
+  color: white;
+}

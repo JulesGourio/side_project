@@ -1,0 +1,18 @@
+{
+  "_comment": "Per-target env var overrides for the deployed app. Single source of truth read by both deploy_latlang.ps1 (local/manual deploys) and render_target_config_env.py -- do not hardcode these values a second time anywhere else. A key omitted for a target means: keep app.yaml's own default.",
+  "uat": {
+    "LAKEBASE_DATABASE": "latlang",
+    "TRANSLATE_VOLUME_PATH": "/Volumes/uat_proj/latlang/latlang",
+    "SOFFICE_ARCHIVE_VOLUME_PATH": "/Volumes/uat_proj/latlang/latlang/libreoffice/libreoffice-25.8.7-linux-x64-v1.tar.gz"
+  },
+  "uat-test": {
+    "LAKEBASE_DATABASE": "latlang_test",
+    "TRANSLATE_VOLUME_PATH": "/Volumes/uat_proj/latlang/latlang_test",
+    "SOFFICE_ARCHIVE_VOLUME_PATH": "/Volumes/uat_proj/latlang/latlang_test/libreoffice/libreoffice-25.8.7-linux-x64-v1.tar.gz"
+  },
+  "prod": {
+    "LAKEBASE_DATABASE": "latlang",
+    "TRANSLATE_VOLUME_PATH": "/Volumes/prod_proj/latlang/latlang",
+    "SOFFICE_ARCHIVE_VOLUME_PATH": "/Volumes/prod_proj/latlang/latlang/libreoffice/libreoffice-25.8.7-linux-x64-v1.tar.gz"
+  }
+}

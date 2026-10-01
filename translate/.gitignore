@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env.local
+target_config.env
+.databricks/
+node_modules/
+client/out/
+client/dist/
+*.egg-info/
+.pytest_cache/
+lakebase_backups/
+Translator/

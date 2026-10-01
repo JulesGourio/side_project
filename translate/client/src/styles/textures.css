@@ -1,0 +1,26 @@
+/**
+ * Subtle Grain Texture Overlay
+ *
+ * Applied to <body> via .texture-overlay class (see app/layout.tsx)
+ * Creates a barely visible film grain effect for visual warmth.
+ * Theme-agnostic - uses blend mode instead of hardcoded colors.
+ */
+
+.texture-overlay {
+  position: relative;
+}
+
+.texture-overlay::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  opacity: 0.03;
+  pointer-events: none;
+
+  /* Pure SVG noise - theme-agnostic */
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence baseFrequency='0.9' numOctaves='4'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.5'/%3E%3C/svg%3E");
+
+  /* Blend with theme colors automatically */
+  mix-blend-mode: overlay;
+  background-size: 200px 200px; /* Tile for better performance */
+}

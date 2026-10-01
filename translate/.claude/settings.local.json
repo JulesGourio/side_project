@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__jcodemunch__index_folder",
+      "Bash(rm *)"
+    ]
+  }
+}
